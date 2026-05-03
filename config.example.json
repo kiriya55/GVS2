@@ -1,0 +1,43 @@
+{
+  "gvs2": {
+    "video_path": "/path/to/your/video.mp4",
+    "ass_input_path": "/path/to/your/subtitles.ass",
+    "ass_output_path": "/path/to/your/output.ass",
+    "subtitle_region_start": 80,
+    "subtitle_region_end": 100,
+    "subtitle_language": "auto",
+    "preview_time_ratio": 50,
+    "style_description_text": "",
+    "style_compact_text": "",
+    "style_profiles": [],
+    "include_samples": false,
+    "style_job": {
+      "enabled": true,
+      "provider_type": "openai",
+      "model": "your-model-name",
+      "base_url": "https://your-api-endpoint/v1",
+      "api_key": "your-api-key",
+      "max_output_tokens": 256,
+      "timeout_sec": 60,
+      "concurrency": 5,
+      "image_format": "WEBP",
+      "max_edge": 500,
+      "quality": 50,
+      "disable_thinking": true
+    },
+    "text_job": {
+      "enabled": false,
+      "provider_type": "openai",
+      "model": "your-model-name",
+      "base_url": "https://your-api-endpoint/v1",
+      "api_key": "your-api-key",
+      "max_output_tokens": 256,
+      "timeout_sec": 60,
+      "concurrency": 2,
+      "image_format": "WEBP",
+      "max_edge": 500,
+      "quality": 60,
+      "disable_thinking": true
+    }
+  }
+}

@@ -1,0 +1,44 @@
+[
+  {
+    "sample_id": "sample-001",
+    "expected_style_id": 1,
+    "expected_text": "你好，世界",
+    "actual_style_id": 1,
+    "actual_text": "你好，世界",
+    "llm_name": "GPT-4o 测试",
+    "model_name": "gpt-4o",
+    "style_input_tokens": 1200,
+    "style_output_tokens": 15,
+    "text_input_tokens": 800,
+    "text_output_tokens": 20,
+    "estimated_cost_usd": 0.0032
+  },
+  {
+    "sample_id": "sample-002",
+    "expected_style_id": 2,
+    "expected_text": "今天也要加油",
+    "actual_style_id": 1,
+    "actual_text": "今天也要加由",
+    "llm_name": "GPT-4o 测试",
+    "model_name": "gpt-4o",
+    "style_input_tokens": 1200,
+    "style_output_tokens": 15,
+    "text_input_tokens": 800,
+    "text_output_tokens": 18,
+    "estimated_cost_usd": 0.0031
+  },
+  {
+    "sample_id": "sample-003",
+    "expected_style_id": 2,
+    "expected_text": "今天也要加油",
+    "actual_style_id": 2,
+    "actual_text": "今天也要加油",
+    "llm_name": "Claude Sonnet 测试",
+    "model_name": "claude-sonnet-4-6",
+    "style_input_tokens": 1100,
+    "style_output_tokens": 12,
+    "text_input_tokens": 750,
+    "text_output_tokens": 18,
+    "estimated_cost_usd": 0.0028
+  }
+]

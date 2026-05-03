@@ -1,0 +1,34 @@
+[
+  {
+    "style_id": 1,
+    "display_name": "Style 1",
+    "ass_style_name": "green_2lines",
+    "feature_notes": "white text; green outline; 2_lines;",
+    "layout_hint": "double",
+    "samples": []
+  },
+  {
+    "style_id": 2,
+    "display_name": "Style 2",
+    "ass_style_name": "green_1line",
+    "feature_notes": "white text; green outline; single_line",
+    "layout_hint": "single",
+    "samples": []
+  },
+  {
+    "style_id": 3,
+    "display_name": "Style 3",
+    "ass_style_name": "red_2lines",
+    "feature_notes": "white text; red outline; 2_lines",
+    "layout_hint": "double",
+    "samples": []
+  },
+  {
+    "style_id": 4,
+    "display_name": "Style 4",
+    "ass_style_name": "red_1line",
+    "feature_notes": "white text; red outline; single_line",
+    "layout_hint": "single",
+    "samples": []
+  }
+]
