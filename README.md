@@ -2,9 +2,9 @@
 
 GVS2 是一个利用视觉大语言模型（Vision LLM）从视频中识别硬字幕样式及其内容，自动回写 ASS 字幕文件的桌面应用。
 
-本项目在"用视觉 LLM 替代传统 OCR 读取硬字幕"的核心思路上进行了大幅改进和重构。与 video-subtitle-extractor (VSE) 等工具相比，本项目不依赖本地 GPU 进行识别，也避免了部分字体下完全无法识别文本的情况。
+本项目在[GVS](https://github.com/jianchang512/gvs)"用视觉 LLM 替代传统 OCR 读取硬字幕"的核心思路上进行了大幅改进和重构。与 [video-subtitle-extractor (VSE)](https://github.com/YaoFANGUK/video-subtitle-extractor) 等工具相比，本项目不依赖本地 GPU 进行识别，也避免了部分字体下完全无法识别文本的情况。
 
-GVS2 主要用于衔接 MagiaTimeline（打轴）到 VideoCaptioner（翻译）之间的空白环节：匹配其他语种硬字幕样式，便于更快确定中文字幕对应的不遮挡原始字幕的样式，然后通过 ASS 源文件编辑或 Aegisub 批量修改等方式修改为对应样式。
+GVS2 主要用于衔接 [MagiaTimeline](https://github.com/HurryPeng/MagiaTimeline)（打轴）到 [VideoCaptioner](https://github.com/WEIFENG2333/VideoCaptioner)（翻译）之间的空白环节：匹配其他语种硬字幕样式，便于更快确定中文字幕对应的不遮挡原始字幕的样式，然后通过 ASS 源文件编辑或 Aegisub 批量修改等方式修改为对应样式。
 
 此外，GVS2 也适用于识别字幕文本，主要适用场景为其他语种硬字幕固定出现于视频底部时的情况。
 
@@ -160,8 +160,10 @@ GVS2 的另一核心能力是提取视频中硬字幕的文本内容。支持自
 
 ## 开发目标
 
-MagiaTimeline 识别的字幕仍然需要通过其他软件确定是否存在错误时间轴，编辑后再导入 GVS2 进行识别。接下来的主要目标包括：
+[MagiaTimeline](https://github.com/HurryPeng/MagiaTimeline) 识别的字幕仍然需要转换为srt后，通过其他软件确定是否存在错误时间轴，编辑后再导入 GVS2 进行识别。接下来的主要目标包括：
 
+- 整合时间轴修改功能或新建时间轴修改脚本
 - 更紧密的打轴与样式识别流程整合
 - 更智能的样式匹配与自动分类
+- 更准确的样式匹配效果
 - 更多字幕场景的适配
