@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from models.style_profile import StyleProfile
 from models.subtitle_event import SubtitleEvent
-
-
-NO_MATCH_JSON = '{"m":0}'
+from providers.base import NO_MATCH_JSON
 TEXT_DRY_RUN_NO_MATCH_JSON = '{"m":0,"t":"未识别到字幕"}'
 
 

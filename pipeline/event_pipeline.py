@@ -10,6 +10,7 @@ import requests
 
 from models.job_result import EventJobResult
 from models.style_profile import StyleProfile, load_sample_images
+from models.subtitle_event import REVIEW_STYLE_NAME
 from providers.base import ProviderConfig
 from providers.factory import build_provider
 from providers.prompt_builder import build_style_job_prompt, build_text_job_prompt
@@ -21,9 +22,6 @@ from services.subtitle_parser import AssDocument
 
 
 logger = logging.getLogger(__name__)
-
-
-REVIEW_STYLE_NAME = "需核查"
 
 
 @dataclass(slots=True)
@@ -85,15 +83,20 @@ class EventPipeline:
             raise last_error
         raise RuntimeError("classification failed without error")
 
-    def _build_images(self, video_path: str, event, image_options: ImageEncodingOptions) -> list[tuple[str, str]]:
-        images: list[tuple[str, str]] = []
+    def _extract_raw_frames(self, video_path: str, event) -> list[bytes]:
         sample_times = list(build_sample_times(event, 1))
-        logger.debug(f"_build_images: {event.event_id}, 采样时间={sample_times}")
+        frames: list[bytes] = []
         for sample_ms in sample_times:
             frame_bytes = extract_frame_ffmpeg(video_path, sample_ms / 1000)
-            if not frame_bytes:
-                logger.debug(f"_build_images: {event.event_id}, 采样时间={sample_ms}ms 未提取到帧")
-                continue
+            if frame_bytes:
+                frames.append(frame_bytes)
+        return frames
+
+    def _build_images(self, video_path: str, event, image_options: ImageEncodingOptions, raw_frames: list[bytes] | None = None) -> list[tuple[str, str]]:
+        if raw_frames is None:
+            raw_frames = self._extract_raw_frames(video_path, event)
+        images: list[tuple[str, str]] = []
+        for frame_bytes in raw_frames:
             images.append(
                 preprocess_for_llm(
                     frame_bytes,
@@ -102,13 +105,12 @@ class EventPipeline:
                     end_percent=self.settings.subtitle_region_end,
                 )
             )
-        logger.debug(f"_build_images: {event.event_id}, 返回 {len(images)} 张图像")
         return images
 
-    def _process_style_event(self, video_path: str, event, style_profiles: list[StyleProfile], sample_images: list[tuple[str, str]] | None = None) -> EventJobResult:
+    def _process_style_event(self, video_path: str, event, style_profiles: list[StyleProfile], sample_images: list[tuple[str, str]] | None = None, raw_frames: list[bytes] | None = None) -> EventJobResult:
         logger.debug(f"_process_style_event: 开始处理 {event.event_id}")
         event_result = EventJobResult(event_id=event.event_id)
-        style_images = self._build_images(video_path, event, self.settings.style_image_options)
+        style_images = self._build_images(video_path, event, self.settings.style_image_options, raw_frames)
         if not style_images:
             logger.warning(f"_process_style_event: {event.event_id} 无可用图像，跳过")
             event_result.final_action = "skip"
@@ -144,10 +146,10 @@ class EventPipeline:
                 event_result.final_action = "failed"
         return event_result
 
-    def _process_text_event(self, video_path: str, event) -> EventJobResult:
+    def _process_text_event(self, video_path: str, event, raw_frames: list[bytes] | None = None) -> EventJobResult:
         logger.debug(f"_process_text_event: 开始处理 {event.event_id}")
         event_result = EventJobResult(event_id=event.event_id)
-        text_images = self._build_images(video_path, event, self.settings.text_image_options)
+        text_images = self._build_images(video_path, event, self.settings.text_image_options, raw_frames)
         if not text_images:
             logger.warning(f"_process_text_event: {event.event_id} 无可用图像，跳过")
             event_result.final_action = "skip"
@@ -171,18 +173,17 @@ class EventPipeline:
                 event_result.final_action = "failed"
         return event_result
 
+    _ACTION_PRIORITY = {"skip": 0, "failed": 1, "text_only": 2, "apply_style": 3, "review_style": 3}
+
     def _merge_results(self, base: EventJobResult, extra: EventJobResult) -> EventJobResult:
         if extra.style_result is not None:
             base.style_result = extra.style_result
         if extra.text_result is not None:
             base.text_result = extra.text_result
-        if extra.final_action != "skip":
-            if extra.final_action == "failed" and base.final_action in {"apply_style", "review_style", "text_only"}:
-                pass
-            elif extra.final_action == "text_only" and base.final_action in {"apply_style", "review_style"}:
-                pass
-            else:
-                base.final_action = extra.final_action
+        base_p = self._ACTION_PRIORITY.get(base.final_action, 0)
+        extra_p = self._ACTION_PRIORITY.get(extra.final_action, 0)
+        if extra_p > base_p:
+            base.final_action = extra.final_action
         base.error_messages.extend(extra.error_messages)
         return base
 
@@ -196,6 +197,15 @@ class EventPipeline:
             if progress_callback is not None:
                 progress_callback(completed, total, message)
 
+        # Pre-extract raw frames once when both phases are enabled to avoid duplicate ffmpeg calls
+        frame_cache: dict[str, list[bytes]] = {}
+        if self.style_provider is not None and self.text_provider is not None:
+            logger.info(f"run: 预提取帧，共 {total} 条")
+            emit_progress(f"预提取视频帧，共 {total} 条")
+            for event in ass_document.events:
+                frame_cache[event.event_id] = self._extract_raw_frames(video_path, event)
+            logger.info(f"run: 帧预提取完成")
+
         if self.style_provider is not None:
             logger.info(f"run: 启动样式识别，共 {total} 条，并发数={max(1, self.style_provider.config.concurrency)}")
             emit_progress(f"开始样式识别，共 {total} 条")
@@ -208,7 +218,7 @@ class EventPipeline:
                     logger.info(f"run: 已加载 {len(sample_images)} 张样式样本图作为 few-shot 参考")
             max_workers = max(1, self.style_provider.config.concurrency)
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_map = {executor.submit(self._process_style_event, video_path, event, style_profiles, sample_images): event for event in ass_document.events}
+                future_map = {executor.submit(self._process_style_event, video_path, event, style_profiles, sample_images, frame_cache.get(event.event_id)): event for event in ass_document.events}
                 for future in as_completed(future_map):
                     event_result = future.result()
                     self._merge_results(results_map[event_result.event_id], event_result)
@@ -222,7 +232,7 @@ class EventPipeline:
             emit_progress(f"开始文字提取，共 {total} 条")
             max_workers = max(1, self.text_provider.config.concurrency)
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_map = {executor.submit(self._process_text_event, video_path, event): event for event in ass_document.events}
+                future_map = {executor.submit(self._process_text_event, video_path, event, frame_cache.get(event.event_id)): event for event in ass_document.events}
                 for future in as_completed(future_map):
                     event_result = future.result()
                     self._merge_results(results_map[event_result.event_id], event_result)
@@ -230,17 +240,14 @@ class EventPipeline:
                     emit_progress(f"文字提取进度 {completed}/{total}")
             logger.info(f"run: 文字提取完成，已处理 {completed}/{total}")
 
-        # 统计最终结果
         action_counts = {}
         error_count = 0
         for result in results_map.values():
-            action = result.final_action
-            action_counts[action] = action_counts.get(action, 0) + 1
+            action_counts[result.final_action] = action_counts.get(result.final_action, 0) + 1
             if result.error_messages:
                 error_count += 1
-        
         logger.info(f"EventPipeline.run: 处理完成，结果统计: {action_counts}")
         if error_count > 0:
             logger.warning(f"EventPipeline.run: 有 {error_count} 个事件处理出错")
-        
+
         return [results_map[event.event_id] for event in ass_document.events]

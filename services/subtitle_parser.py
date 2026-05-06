@@ -228,3 +228,102 @@ def parse_subtitle_document(path: str) -> AssDocument:
     if suffix == ".srt":
         return parse_srt(path)
     raise ValueError("仅支持 ASS 或 SRT 输入")
+
+
+def _parse_ass_color(color: str) -> str:
+    """Convert ASS &HAABBGGRR color to a human-readable description."""
+    color = color.strip().lstrip("&H").lstrip("H")
+    if len(color) < 6:
+        return ""
+    rr = color[-2:]
+    gg = color[-4:-2]
+    bb = color[-6:-4]
+    try:
+        r, g, b = int(rr, 16), int(gg, 16), int(bb, 16)
+    except ValueError:
+        return ""
+    if r > 200 and g < 80 and b < 80:
+        return "red"
+    if r > 200 and g > 200 and b < 80:
+        return "yellow"
+    if r > 200 and g > 200 and b > 200:
+        return "white"
+    if r < 80 and g > 180 and b < 80:
+        return "green"
+    if r < 80 and g < 80 and b > 200:
+        return "blue"
+    if r < 60 and g < 60 and b < 60:
+        return "black"
+    return f"#{rr}{gg}{bb}"
+
+
+def _ass_style_to_feature_notes(fields: dict[str, str]) -> str:
+    """Build a compact feature_notes string from ASS style fields."""
+    parts: list[str] = []
+    primary = fields.get("PrimaryColour", "")
+    if primary:
+        desc = _parse_ass_color(primary)
+        if desc:
+            parts.append(f"{desc}_text")
+    outline_color = fields.get("OutlineColour", "")
+    if outline_color:
+        desc = _parse_ass_color(outline_color)
+        if desc:
+            parts.append(f"{desc}_outline")
+    bold = fields.get("Bold", "0")
+    if bold.strip() in ("1", "-1"):
+        parts.append("bold")
+    outline = fields.get("Outline", "0")
+    try:
+        if float(outline.strip()) > 2:
+            parts.append("thick_outline")
+    except ValueError:
+        pass
+    font_size = fields.get("Fontsize", "")
+    if font_size:
+        parts.append(f"size_{font_size}")
+    return "; ".join(parts) + ";" if parts else ""
+
+
+def parse_ass_styles(path: str) -> list[dict]:
+    """Parse [V4+ Styles] section from an ASS file.
+
+    Returns a list of dicts with keys: style_id, display_name, ass_style_name,
+    feature_notes, layout_hint (always 'either').
+    """
+    raw_lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
+    style_format: list[str] = []
+    results: list[dict] = []
+    in_styles = False
+    index = 0
+
+    for line in raw_lines:
+        stripped = line.strip()
+        if stripped.startswith("[V4+ Styles]") or stripped.startswith("[V4 Styles]"):
+            in_styles = True
+            continue
+        if in_styles and stripped.startswith("["):
+            break
+        if not in_styles:
+            continue
+        if stripped.startswith("Format:"):
+            style_format = [f.strip() for f in stripped[len("Format:"):].split(",")]
+            continue
+        if stripped.startswith("Style:"):
+            payload = stripped[len("Style:"):].strip()
+            values = [v.strip() for v in payload.split(",", len(style_format) - 1)]
+            if len(values) < len(style_format):
+                continue
+            fields = dict(zip(style_format, values))
+            index += 1
+            name = fields.get("Name", f"Style{index}")
+            results.append({
+                "style_id": index,
+                "display_name": name,
+                "ass_style_name": name,
+                "feature_notes": _ass_style_to_feature_notes(fields),
+                "layout_hint": "either",
+            })
+
+    logger.info(f"parse_ass_styles: 从 {path} 解析到 {len(results)} 个样式")
+    return results

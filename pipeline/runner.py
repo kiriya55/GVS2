@@ -72,18 +72,4 @@ def run_gvs2(
     
     AssWriter().write(document, ass_output_path)
     logger.info(f"run_gvs2: 写入输出完成，{ass_output_path}")
-    
-    # 统计结果
-    action_counts = {}
-    error_count = 0
-    for result in results:
-        action = result.final_action
-        action_counts[action] = action_counts.get(action, 0) + 1
-        if result.error_messages:
-            error_count += 1
-    
-    logger.info(f"run_gvs2: 处理完成，结果统计: {action_counts}")
-    if error_count > 0:
-        logger.warning(f"run_gvs2: 有 {error_count} 个事件处理出错")
-    
     return results

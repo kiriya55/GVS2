@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtWidgets import (
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QMessageBox,
 )
 
 from models.style_profile import StyleProfile
@@ -54,6 +56,19 @@ ENV_DEFAULTS = {
         "model": "GVS2_ANTHROPIC_MODEL",
     },
 }
+
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
+
+
+def browse_row(edit: QLineEdit, handler) -> QWidget:
+    container = QWidget()
+    row = QHBoxLayout(container)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.addWidget(edit)
+    button = QPushButton("浏览")
+    button.clicked.connect(handler)
+    row.addWidget(button)
+    return container
 
 
 def _read_env(name: str) -> str:
@@ -135,8 +150,21 @@ class StylePrepWorker(QThread):
 class ProviderJobWidget(QGroupBox):
     def __init__(self, title: str, *, enabled: bool, default_model: str, default_max_edge: int, default_max_output_tokens: int = 256) -> None:
         super().__init__(title)
+        self._history: list[dict] = []
+
         self.enabled_checkbox = QCheckBox("启用")
         self.enabled_checkbox.setChecked(enabled)
+
+        self.history_combo = QComboBox()
+        self.history_combo.setMinimumWidth(180)
+        self.history_combo.setPlaceholderText("历史记录…")
+        self.history_combo.currentIndexChanged.connect(self._apply_history_selection)
+        self.save_history_button = QPushButton("保存当前")
+        self.save_history_button.setToolTip("将当前 Provider 配置保存到历史记录")
+        self.save_history_button.clicked.connect(self._save_current_to_history)
+        self.delete_history_button = QPushButton("删除")
+        self.delete_history_button.setToolTip("删除选中的历史记录")
+        self.delete_history_button.clicked.connect(self._delete_selected_history)
 
         self.provider_combo = QComboBox()
         self.provider_combo.addItems(["openai", "anthropic"])
@@ -169,6 +197,13 @@ class ProviderJobWidget(QGroupBox):
         layout.setContentsMargins(8, 8, 8, 8)
 
         layout.addWidget(self.enabled_checkbox)
+
+        history_row = QHBoxLayout()
+        history_row.addWidget(QLabel("历史"))
+        history_row.addWidget(self.history_combo, 1)
+        history_row.addWidget(self.save_history_button)
+        history_row.addWidget(self.delete_history_button)
+        layout.addLayout(history_row)
 
         basic_form = QFormLayout()
         basic_form.addRow("接口类型", self.provider_combo)
@@ -242,6 +277,64 @@ class ProviderJobWidget(QGroupBox):
             self.base_url_edit.setText(env_base_url)
         if not self.api_key_edit.text().strip() and env_api_key:
             self.api_key_edit.setText(env_api_key)
+
+    # ---- provider history ----
+
+    def _history_label(self, entry: dict) -> str:
+        ptype = entry.get("provider_type", "?")
+        model = entry.get("model", "?")
+        return f"{ptype} / {model}"
+
+    def _refresh_history_combo(self) -> None:
+        self.history_combo.blockSignals(True)
+        self.history_combo.clear()
+        for entry in self._history:
+            self.history_combo.addItem(self._history_label(entry))
+        self.history_combo.setCurrentIndex(-1)
+        self.history_combo.blockSignals(False)
+
+    def _apply_history_selection(self, index: int) -> None:
+        if index < 0 or index >= len(self._history):
+            return
+        entry = self._history[index]
+        self.provider_combo.setCurrentText(entry.get("provider_type", "openai"))
+        self.model_edit.setText(entry.get("model", ""))
+        self.base_url_edit.setText(entry.get("base_url", ""))
+        self.api_key_edit.setText(entry.get("api_key", ""))
+
+    def _save_current_to_history(self) -> None:
+        entry = {
+            "provider_type": self.provider_combo.currentText(),
+            "model": self.model_edit.text().strip(),
+            "base_url": self.base_url_edit.text().strip(),
+            "api_key": self.api_key_edit.text().strip(),
+        }
+        if not entry["model"]:
+            QMessageBox.warning(self, self.title(), "请先填写模型名称再保存。")
+            return
+        for existing in self._history:
+            if (existing.get("provider_type") == entry["provider_type"]
+                    and existing.get("model") == entry["model"]
+                    and existing.get("base_url") == entry["base_url"]):
+                existing["api_key"] = entry["api_key"]
+                self._refresh_history_combo()
+                return
+        self._history.append(entry)
+        self._refresh_history_combo()
+
+    def _delete_selected_history(self) -> None:
+        index = self.history_combo.currentIndex()
+        if index < 0 or index >= len(self._history):
+            return
+        self._history.pop(index)
+        self._refresh_history_combo()
+
+    def load_history(self, history: list[dict]) -> None:
+        self._history = list(history)
+        self._refresh_history_combo()
+
+    def dump_history(self) -> list[dict]:
+        return [dict(h) for h in self._history]
 
     def build_provider_config(self) -> ProviderConfig | None:
         if not self.enabled_checkbox.isChecked():
@@ -348,3 +441,10 @@ class ApiSettingsDialog(QDialog):
 
     def dump_settings(self) -> tuple[dict, dict]:
         return self.style_job_widget.dump_settings(), self.text_job_widget.dump_settings()
+
+    def load_history(self, style_history: list[dict], text_history: list[dict]) -> None:
+        self.style_job_widget.load_history(style_history)
+        self.text_job_widget.load_history(text_history)
+
+    def dump_history(self) -> tuple[list[dict], list[dict]]:
+        return self.style_job_widget.dump_history(), self.text_job_widget.dump_history()

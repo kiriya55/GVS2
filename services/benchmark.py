@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import Iterable
+from typing import Iterable, List
 
 
 @dataclass(slots=True)
@@ -126,3 +126,63 @@ class BenchmarkScorer:
             if idx == 0:
                 formatted.append("-+-".join("-" * width for width in widths))
         return "\n".join(formatted)
+
+
+def _strip_ass_formatting(text: str) -> str:
+    """Remove ASS override tags like {\\b1} from text."""
+    import re
+    return re.sub(r"\{[^}]*\}", "", text).replace("\\N", "\n").strip()
+
+
+def extract_benchmark_samples(
+    ground_truth_path: str,
+    result_path: str,
+    *,
+    llm_name: str = "",
+    model_name: str = "",
+    time_tolerance_ms: int = 500,
+) -> List[BenchmarkSample]:
+    """Compare two ASS files event-by-event to produce benchmark samples.
+
+    Matches events by start time within *time_tolerance_ms*.  The ground-truth
+    file provides ``expected_*`` values; the result file provides ``actual_*``.
+    """
+    from services.subtitle_parser import parse_ass
+
+    gt_doc = parse_ass(ground_truth_path)
+    rs_doc = parse_ass(result_path)
+
+    gt_events = sorted(gt_doc.events, key=lambda e: e.start_ms)
+    rs_events = sorted(rs_doc.events, key=lambda e: e.start_ms)
+
+    samples: list[BenchmarkSample] = []
+    rs_index = 0
+
+    for gt in gt_events:
+        best = None
+        best_diff = time_tolerance_ms + 1
+        # advance result pointer close to gt start
+        while rs_index < len(rs_events) - 1 and rs_events[rs_index].end_ms < gt.start_ms - time_tolerance_ms:
+            rs_index += 1
+        # scan nearby results
+        for j in range(max(0, rs_index - 1), min(len(rs_events), rs_index + 3)):
+            diff = abs(rs_events[j].start_ms - gt.start_ms)
+            if diff < best_diff:
+                best_diff = diff
+                best = rs_events[j]
+        if best is None or best_diff > time_tolerance_ms:
+            continue
+
+        samples.append(
+            BenchmarkSample(
+                sample_id=f"event-{gt.index + 1}",
+                expected_style_id=None,
+                expected_text=_strip_ass_formatting(gt.text),
+                actual_style_id=None,
+                actual_text=_strip_ass_formatting(best.text),
+                llm_name=llm_name,
+                model_name=model_name,
+            )
+        )
+
+    return samples

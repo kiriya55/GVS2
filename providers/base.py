@@ -46,6 +46,25 @@ class ProviderResponse:
     usage: ProviderUsage = field(default_factory=ProviderUsage)
 
 
+NO_MATCH_JSON = '{"m":0}'
+
+_CLAUDE_PRICING_USD_PER_1M: dict[str, tuple[float, float]] = {
+    "claude-opus-4-7": (5.0, 25.0),
+    "claude-opus-4-6": (5.0, 25.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+}
+
+
+def estimate_cost(model: str, pricing: dict[str, tuple[float, float]], usage: ProviderUsage) -> float | None:
+    merged = {**_CLAUDE_PRICING_USD_PER_1M, **pricing}
+    prices = merged.get(model)
+    if prices is None:
+        return None
+    input_price, output_price = prices
+    return usage.total_input_tokens / 1_000_000 * input_price + usage.output_tokens / 1_000_000 * output_price
+
+
 class VisionProvider(Protocol):
     config: ProviderConfig
     capabilities: ProviderCapabilities

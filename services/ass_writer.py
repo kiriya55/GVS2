@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from models.subtitle_event import REVIEW_STYLE_NAME
 from services.subtitle_parser import AssDocument, GeneratedAssDocument
-
-
-REVIEW_STYLE_NAME = "需核查"
 REVIEW_STYLE_LINE = "Style: 需核查,Arial,54,&H0000FFFF,&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,3,1,2,48,48,42,1\n"
 
 

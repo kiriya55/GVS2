@@ -25,12 +25,12 @@ from PySide6.QtWidgets import (
 )
 
 from benchmark_app import load_samples
-from services.benchmark import BenchmarkScorer
+from services.benchmark import BenchmarkScorer, extract_benchmark_samples
 from storage.settings_store import SettingsStore
+from ui.widgets import CONFIG_PATH, browse_row
 
 
 WINDOW_TITLE = "GVS2 Benchmark"
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
 
 
 class BenchmarkWindow(QMainWindow):
@@ -53,6 +53,26 @@ class BenchmarkWindow(QMainWindow):
         file_form.addRow("JSON", self._with_browse(self.samples_path_edit, self._browse_samples))
         file_box.setLayout(file_form)
         layout.addWidget(file_box)
+
+        ass_compare_box = QGroupBox("ASS 对比导入")
+        ass_compare_form = QFormLayout()
+        self.gt_ass_edit = QLineEdit()
+        self.result_ass_edit = QLineEdit()
+        ass_compare_form.addRow("标准答案 ASS", self._with_browse(self.gt_ass_edit, self._browse_gt_ass))
+        ass_compare_form.addRow("识别结果 ASS", self._with_browse(self.result_ass_edit, self._browse_result_ass))
+        ass_llm_row = QHBoxLayout()
+        self.ass_llm_name_edit = QLineEdit()
+        self.ass_llm_name_edit.setPlaceholderText("自定义名称（可选）")
+        self.ass_model_name_edit = QLineEdit()
+        self.ass_model_name_edit.setPlaceholderText("模型名（可选）")
+        ass_llm_row.addWidget(self.ass_llm_name_edit)
+        ass_llm_row.addWidget(self.ass_model_name_edit)
+        ass_compare_form.addRow("LLM / 模型", ass_llm_row)
+        self.extract_button = QPushButton("提取对比样本")
+        self.extract_button.clicked.connect(self._extract_from_ass)
+        ass_compare_form.addRow(self.extract_button)
+        ass_compare_box.setLayout(ass_compare_form)
+        layout.addWidget(ass_compare_box)
 
         options_box = QGroupBox("分组方式")
         options_layout = QHBoxLayout(options_box)
@@ -100,19 +120,22 @@ class BenchmarkWindow(QMainWindow):
         right_layout.addWidget(self.table, 1)
 
     def _with_browse(self, edit: QLineEdit, handler) -> QWidget:
-        container = QWidget()
-        row = QHBoxLayout(container)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.addWidget(edit)
-        button = QPushButton("浏览")
-        button.clicked.connect(handler)
-        row.addWidget(button)
-        return container
+        return browse_row(edit, handler)
 
     def _browse_samples(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "选择 benchmark JSON", "", "JSON files (*.json);;All files (*)")
         if path:
             self.samples_path_edit.setText(path)
+
+    def _browse_gt_ass(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择标准答案 ASS", "", "ASS files (*.ass);;All files (*)")
+        if path:
+            self.gt_ass_edit.setText(path)
+
+    def _browse_result_ass(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择识别结果 ASS", "", "ASS files (*.ass);;All files (*)")
+        if path:
+            self.result_ass_edit.setText(path)
 
     def _get_samples_path(self) -> str:
         path = self.samples_path_edit.text().strip()
@@ -121,6 +144,52 @@ class BenchmarkWindow(QMainWindow):
         if not Path(path).exists():
             raise ValueError("样本 JSON 不存在")
         return path
+
+    def _extract_from_ass(self) -> None:
+        gt_path = self.gt_ass_edit.text().strip()
+        result_path = self.result_ass_edit.text().strip()
+        if not gt_path or not result_path:
+            QMessageBox.warning(self, WINDOW_TITLE, "请先选择标准答案和识别结果两个 ASS 文件。")
+            return
+        if not Path(gt_path).exists():
+            QMessageBox.critical(self, WINDOW_TITLE, f"标准答案文件不存在：{gt_path}")
+            return
+        if not Path(result_path).exists():
+            QMessageBox.critical(self, WINDOW_TITLE, f"识别结果文件不存在：{result_path}")
+            return
+        try:
+            samples = extract_benchmark_samples(
+                gt_path,
+                result_path,
+                llm_name=self.ass_llm_name_edit.text().strip(),
+                model_name=self.ass_model_name_edit.text().strip(),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, WINDOW_TITLE, f"提取失败：{exc}")
+            return
+        if not samples:
+            QMessageBox.warning(self, WINDOW_TITLE, "未能匹配到任何字幕事件，请检查两个 ASS 文件的时间轴。")
+            return
+        save_path, _ = QFileDialog.getSaveFileName(self, "保存提取的样本", "benchmark_extracted.json", "JSON files (*.json)")
+        if not save_path:
+            return
+        data = [
+            {
+                "sample_id": s.sample_id,
+                "expected_style_id": s.expected_style_id,
+                "expected_text": s.expected_text,
+                "actual_style_id": s.actual_style_id,
+                "actual_text": s.actual_text,
+                "llm_name": s.llm_name,
+                "model_name": s.model_name,
+            }
+            for s in samples
+        ]
+        Path(save_path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.samples_path_edit.setText(save_path)
+        self.preview_edit.setPlainText(json.dumps(data, ensure_ascii=False, indent=2))
+        QMessageBox.information(self, WINDOW_TITLE, f"已提取 {len(samples)} 条对比样本，已保存并加载。")
+        self._save_settings()
 
     def _preview_samples(self) -> None:
         try:
@@ -166,6 +235,10 @@ class BenchmarkWindow(QMainWindow):
     def _load_settings(self) -> None:
         data = self.settings_store.load().get("benchmark", {})
         self.samples_path_edit.setText(data.get("samples_path", ""))
+        self.gt_ass_edit.setText(data.get("gt_ass_path", ""))
+        self.result_ass_edit.setText(data.get("result_ass_path", ""))
+        self.ass_llm_name_edit.setText(data.get("ass_llm_name", ""))
+        self.ass_model_name_edit.setText(data.get("ass_model_name", ""))
         use_custom_name = data.get("use_custom_name", True)
         self.custom_name_radio.setChecked(bool(use_custom_name))
         self.model_name_radio.setChecked(not bool(use_custom_name))
@@ -176,6 +249,10 @@ class BenchmarkWindow(QMainWindow):
                 "benchmark": {
                     "samples_path": self.samples_path_edit.text().strip(),
                     "use_custom_name": self.custom_name_radio.isChecked(),
+                    "gt_ass_path": self.gt_ass_edit.text().strip(),
+                    "result_ass_path": self.result_ass_edit.text().strip(),
+                    "ass_llm_name": self.ass_llm_name_edit.text().strip(),
+                    "ass_model_name": self.ass_model_name_edit.text().strip(),
                 }
             }
         )

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List
 
+REVIEW_STYLE_NAME = "需核查"
+
 
 @dataclass(slots=True)
 class SubtitleEvent:
@@ -43,7 +45,10 @@ class SubtitleEvent:
         self.field_values[idx] = value
 
     def set_text(self, value: str) -> None:
-        idx = self.format_fields.index("Text")
+        try:
+            idx = self.format_fields.index("Text")
+        except ValueError:
+            return
         self.field_values[idx] = value
         self.text = value
 

@@ -5,7 +5,7 @@ import json
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 
 from models.job_result import EventJobResult
 from models.style_profile import StyleProfile, StyleSample
+from models.subtitle_event import SubtitleEvent
 from providers.base import ProviderResponse, ProviderUsage
 from providers.prompt_builder import (
     build_style_image_analysis_prompt,
@@ -46,9 +47,10 @@ from providers.prompt_builder import (
 )
 from services.image_preprocess import preprocess_for_llm
 from services.media import extract_frame_ffmpeg, probe_video_duration_ffprobe
-from services.subtitle_parser import parse_subtitle_document
+from services.subtitle_parser import parse_ass_styles, parse_subtitle_document
 from storage.settings_store import SettingsStore
 from ui.widgets import (
+    CONFIG_PATH,
     IMAGE_FORMATS,
     LAYOUT_HINTS,
     STYLE_KEYWORDS_ZH,
@@ -58,11 +60,11 @@ from ui.widgets import (
     ProviderJobWidget,
     RunPayload,
     StylePrepWorker,
+    browse_row,
 )
 
 
 WINDOW_TITLE = "GVS2"
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
 ICON_PATH = Path(__file__).resolve().parents[1] / "ico.ico"
 STYLE_SAMPLE_DIR = Path(__file__).resolve().parents[1] / "style_samples"
 
@@ -85,6 +87,13 @@ class MainWindow(QMainWindow):
         self.api_settings_dialog = ApiSettingsDialog(self)
         self.style_job_widget = self.api_settings_dialog.style_job_widget
         self.text_job_widget = self.api_settings_dialog.text_job_widget
+        self._style_job_history: list[dict] = []
+        self._text_job_history: list[dict] = []
+        self._video_duration: float | None = None
+        self._preview_debounce = QTimer(self)
+        self._preview_debounce.setSingleShot(True)
+        self._preview_debounce.setInterval(200)
+        self._preview_debounce.timeout.connect(self._refresh_video_preview)
         self._setup_ui()
         self._load_settings()
         self._run_startup_checks()
@@ -183,6 +192,9 @@ class MainWindow(QMainWindow):
         self.import_styles_button.clicked.connect(self._import_style_template)
         self.export_styles_button = QPushButton("导出模板 JSON")
         self.export_styles_button.clicked.connect(self._export_style_template)
+        self.import_ass_styles_button = QPushButton("从ASS导入样式")
+        self.import_ass_styles_button.setToolTip("从已有 ASS 文件的 [V4+ Styles] 段导入样式定义")
+        self.import_ass_styles_button.clicked.connect(self._import_ass_styles)
         self.append_compact_style_button = QPushButton("追加当前紧凑描述")
         self.append_compact_style_button.clicked.connect(self._append_compact_style_row)
         self.lock_preview_style_button = QPushButton("从当前预览锁定样式")
@@ -192,6 +204,7 @@ class MainWindow(QMainWindow):
         styles_actions.addWidget(self.renumber_style_button)
         styles_actions.addWidget(self.import_styles_button)
         styles_actions.addWidget(self.export_styles_button)
+        styles_actions.addWidget(self.import_ass_styles_button)
         styles_actions.addWidget(self.append_compact_style_button)
         styles_actions.addWidget(self.lock_preview_style_button)
         styles_layout.addLayout(styles_actions)
@@ -210,18 +223,23 @@ class MainWindow(QMainWindow):
         self.preview_time_slider = QSlider(Qt.Horizontal)
         self.preview_time_slider.setRange(0, 1000)
         self.preview_time_slider.setValue(500)
-        self.preview_time_slider.valueChanged.connect(self._refresh_video_preview)
+        self.preview_time_slider.valueChanged.connect(self._request_preview_refresh)
         self.preview_time_hint = QLabel("预览时间：50%")
         preview_nav = QHBoxLayout()
-        self.prev_subtitle_button = QPushButton("上一个字幕时点")
+        self.prev_subtitle_button = QPushButton("上一个")
         self.prev_subtitle_button.clicked.connect(lambda: self._jump_subtitle_event(-1))
-        self.next_subtitle_button = QPushButton("下一个字幕时点")
+        self.next_subtitle_button = QPushButton("下一个")
         self.next_subtitle_button.clicked.connect(lambda: self._jump_subtitle_event(1))
+        self.subtitle_jump_combo = QComboBox()
+        self.subtitle_jump_combo.setMinimumWidth(200)
+        self.subtitle_jump_combo.setPlaceholderText("跳到指定字幕…")
+        self.subtitle_jump_combo.currentIndexChanged.connect(self._on_jump_combo_selected)
         self.preview_processed_button = QPushButton("预览处理图")
         self.preview_processed_button.clicked.connect(self._show_processed_image_preview)
         self.dry_run_text_button = QPushButton("文字提取试运行")
         self.dry_run_text_button.clicked.connect(self._dry_run_text_recognition)
         preview_nav.addWidget(self.prev_subtitle_button)
+        preview_nav.addWidget(self.subtitle_jump_combo, 1)
         preview_nav.addWidget(self.next_subtitle_button)
         preview_nav.addWidget(self.preview_processed_button)
         preview_nav.addWidget(self.dry_run_text_button)
@@ -243,8 +261,8 @@ class MainWindow(QMainWindow):
         self.subtitle_language_combo = QComboBox()
         for value, label in SUBTITLE_LANGUAGES:
             self.subtitle_language_combo.addItem(label, value)
-        self.region_start_spin.valueChanged.connect(self._refresh_video_preview)
-        self.region_end_spin.valueChanged.connect(self._refresh_video_preview)
+        self.region_start_spin.valueChanged.connect(self._request_preview_refresh)
+        self.region_end_spin.valueChanged.connect(self._request_preview_refresh)
         region_form.addRow("起始百分比", self.region_start_spin)
         region_form.addRow("结束百分比", self.region_end_spin)
         region_form.addRow("字幕语言", self.subtitle_language_combo)
@@ -288,22 +306,17 @@ class MainWindow(QMainWindow):
 
     def _open_api_settings(self) -> None:
         self.api_settings_dialog.load_settings(self.style_job_widget.dump_settings(), self.text_job_widget.dump_settings())
+        self.api_settings_dialog.load_history(self._style_job_history, self._text_job_history)
         if self.api_settings_dialog.exec() == QDialog.Accepted:
             style_job, text_job = self.api_settings_dialog.dump_settings()
             self.style_job_widget.load_settings(style_job)
             self.text_job_widget.load_settings(text_job)
+            self._style_job_history, self._text_job_history = self.api_settings_dialog.dump_history()
             self._save_settings()
             self._run_startup_checks()
 
     def _with_browse(self, edit: QLineEdit, handler, *, save: bool = False) -> QWidget:
-        container = QWidget()
-        row = QHBoxLayout(container)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.addWidget(edit)
-        button = QPushButton("浏览")
-        button.clicked.connect(handler)
-        row.addWidget(button)
-        return container
+        return browse_row(edit, handler)
 
     # ------------------------------------------------------------------
     # File browsing
@@ -313,6 +326,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "选择视频", "", "Videos (*.mp4 *.mkv *.avi *.mov);;All files (*)")
         if path:
             self.video_edit.setText(path)
+            self._video_duration = None
             self._refresh_video_preview()
 
     def _browse_ass_input(self) -> None:
@@ -339,9 +353,37 @@ class MainWindow(QMainWindow):
     # Preview
     # ------------------------------------------------------------------
 
-    def _selected_preview_time_sec(self) -> float:
+    def _get_video_duration(self) -> float | None:
+        if self._video_duration is not None:
+            return self._video_duration
         video_path = self.video_edit.text().strip()
-        duration = probe_video_duration_ffprobe(video_path) if video_path else None
+        if not video_path:
+            return None
+        self._video_duration = probe_video_duration_ffprobe(video_path)
+        return self._video_duration
+
+    def _request_preview_refresh(self) -> None:
+        self._preview_debounce.start()
+
+    def _ensure_preview_frame(self) -> bytes | None:
+        if self.preview_frame_bytes:
+            return self.preview_frame_bytes
+        self._refresh_video_preview()
+        if self.preview_frame_bytes:
+            return self.preview_frame_bytes
+        QMessageBox.warning(self, WINDOW_TITLE, "请先生成视频预览图")
+        return None
+
+    def _preprocess_preview(self, image_options: ImageEncodingOptions) -> tuple[str, str]:
+        return preprocess_for_llm(
+            self.preview_frame_bytes,
+            image_options,
+            start_percent=self.region_start_spin.value(),
+            end_percent=self.region_end_spin.value(),
+        )
+
+    def _selected_preview_time_sec(self) -> float:
+        duration = self._get_video_duration()
         ratio = self.preview_time_slider.value() / 1000
         self.preview_time_hint.setText(f"预览时间：{ratio:.0%}")
         if duration and duration > 0:
@@ -349,8 +391,7 @@ class MainWindow(QMainWindow):
         return 0.0
 
     def _set_preview_to_time_ms(self, time_ms: int) -> None:
-        video_path = self.video_edit.text().strip()
-        duration = probe_video_duration_ffprobe(video_path) if video_path else None
+        duration = self._get_video_duration()
         if not duration or duration <= 0:
             self._refresh_video_preview()
             return
@@ -364,9 +405,34 @@ class MainWindow(QMainWindow):
         next_index = self.current_event_index + step
         next_index = max(0, min(len(self.loaded_events) - 1, next_index))
         self.current_event_index = next_index
+        self.subtitle_jump_combo.blockSignals(True)
+        self.subtitle_jump_combo.setCurrentIndex(next_index)
+        self.subtitle_jump_combo.blockSignals(False)
         event = self.loaded_events[next_index]
         self._set_preview_to_time_ms(event.midpoint_ms)
         self._append_log(f"跳转到字幕事件 {next_index + 1}/{len(self.loaded_events)}：{event.start_ms}-{event.end_ms}ms")
+
+    def _format_event_label(self, event: SubtitleEvent, index: int) -> str:
+        start_sec = event.start_ms / 1000
+        end_sec = event.end_ms / 1000
+        text_preview = event.text.replace("\\N", " ").strip()[:20]
+        return f"#{index + 1} [{start_sec:.1f}s-{end_sec:.1f}s] {text_preview}"
+
+    def _populate_subtitle_jump_combo(self) -> None:
+        self.subtitle_jump_combo.blockSignals(True)
+        self.subtitle_jump_combo.clear()
+        for i, event in enumerate(self.loaded_events):
+            self.subtitle_jump_combo.addItem(self._format_event_label(event, i))
+        if self.current_event_index >= 0:
+            self.subtitle_jump_combo.setCurrentIndex(self.current_event_index)
+        self.subtitle_jump_combo.blockSignals(False)
+
+    def _on_jump_combo_selected(self, index: int) -> None:
+        if index < 0 or not self.loaded_events:
+            return
+        self.current_event_index = index
+        event = self.loaded_events[index]
+        self._set_preview_to_time_ms(event.midpoint_ms)
 
     def _show_style_prompt_preview_dialog(self) -> None:
         dialog = QDialog(self)
@@ -391,10 +457,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _show_processed_image_preview(self) -> None:
-        if not self.preview_frame_bytes:
-            self._refresh_video_preview()
-        if not self.preview_frame_bytes:
-            QMessageBox.warning(self, WINDOW_TITLE, "请先生成视频预览图。")
+        if not self._ensure_preview_frame():
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("当前字幕事件处理图预览")
@@ -405,12 +468,7 @@ class MainWindow(QMainWindow):
             ("text_job", self.text_job_widget.build_image_options()),
         ]
         for title, image_options in previews:
-            _, image_b64 = preprocess_for_llm(
-                self.preview_frame_bytes,
-                image_options,
-                start_percent=self.region_start_spin.value(),
-                end_percent=self.region_end_spin.value(),
-            )
+            _, image_b64 = self._preprocess_preview(image_options)
             image = QImage.fromData(base64.b64decode(image_b64))
             panel = QWidget()
             panel_layout = QVBoxLayout(panel)
@@ -508,27 +566,16 @@ class MainWindow(QMainWindow):
         self._start_style_prep(build_style_refine_prompt(raw), [], "text")
 
     def _analyze_preview_style(self) -> None:
-        if not self.preview_frame_bytes:
-            self._refresh_video_preview()
-        if not self.preview_frame_bytes:
-            QMessageBox.critical(self, WINDOW_TITLE, "请先生成视频预览图")
+        if not self._ensure_preview_frame():
             return
         image_options = self.style_job_widget.build_image_options()
-        image = preprocess_for_llm(
-            self.preview_frame_bytes,
-            image_options,
-            start_percent=self.region_start_spin.value(),
-            end_percent=self.region_end_spin.value(),
-        )
+        image = self._preprocess_preview(image_options)
         self._start_style_prep(build_style_image_analysis_prompt(), [image], "image")
 
     def _dry_run_text_recognition(self) -> None:
         if self.style_prep_worker is not None:
             return
-        if not self.preview_frame_bytes:
-            self._refresh_video_preview()
-        if not self.preview_frame_bytes:
-            QMessageBox.critical(self, WINDOW_TITLE, "请先生成视频预览图")
+        if not self._ensure_preview_frame():
             return
         try:
             provider_config = self.text_job_widget.build_provider_config()
@@ -539,12 +586,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, WINDOW_TITLE, "请先启用并配置文字提取任务，再执行 dry run。")
             return
         image_options = self.text_job_widget.build_image_options()
-        image = preprocess_for_llm(
-            self.preview_frame_bytes,
-            image_options,
-            start_percent=self.region_start_spin.value(),
-            end_percent=self.region_end_spin.value(),
-        )
+        image = self._preprocess_preview(image_options)
         prompt = build_text_dry_run_prompt(self.subtitle_language_combo.currentData() or "auto")
         self.style_prep_mode = "text_dry_run"
         self.refine_style_button.setEnabled(False)
@@ -650,6 +692,21 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, WINDOW_TITLE, str(exc))
 
+    def _import_ass_styles(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "从ASS导入样式", "", "ASS files (*.ass);;All files (*)")
+        if not path:
+            return
+        try:
+            styles = parse_ass_styles(path)
+            if not styles:
+                QMessageBox.warning(self, WINDOW_TITLE, "该 ASS 文件中未找到 [V4+ Styles] 样式定义。")
+                return
+            self._load_style_rows(styles)
+            self._renumber_style_rows()
+            self._append_log(f"已从 ASS 导入 {len(styles)} 个样式：{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, WINDOW_TITLE, f"导入 ASS 样式失败：{exc}")
+
     def _export_style_template(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "导出样式模板", "styles.json", "JSON files (*.json)")
         if not path:
@@ -673,12 +730,7 @@ class MainWindow(QMainWindow):
         if not self.preview_frame_bytes:
             return None
         image_options = self.style_job_widget.build_image_options()
-        _, sample_bytes = preprocess_for_llm(
-            self.preview_frame_bytes,
-            image_options,
-            start_percent=self.region_start_spin.value(),
-            end_percent=self.region_end_spin.value(),
-        )
+        _, sample_bytes = self._preprocess_preview(image_options)
         STYLE_SAMPLE_DIR.mkdir(exist_ok=True)
         timestamp_ms = int(round(self._selected_preview_time_sec() * 1000))
         extension = "jpg" if image_options.format_name.upper() == "JPEG" else image_options.format_name.lower()
@@ -703,10 +755,7 @@ class MainWindow(QMainWindow):
         return StyleSample(image_path=str(image_path), timestamp_ms=timestamp_ms, note=feature_notes)
 
     def _lock_style_from_preview(self) -> None:
-        if not self.preview_frame_bytes:
-            self._refresh_video_preview()
-        if not self.preview_frame_bytes:
-            QMessageBox.critical(self, WINDOW_TITLE, "请先生成视频预览图")
+        if not self._ensure_preview_frame():
             return
         compact = self.style_compact_edit.text().strip()
         if not compact:
@@ -815,9 +864,11 @@ class MainWindow(QMainWindow):
         self.current_event_index = -1
         path = self.ass_input_edit.text().strip()
         if not path:
+            self._populate_subtitle_jump_combo()
             return
         document = parse_subtitle_document(path)
         self.loaded_events = document.events
+        self._populate_subtitle_jump_combo()
         if self.loaded_events:
             self.current_event_index = 0
 
@@ -1077,13 +1128,15 @@ class MainWindow(QMainWindow):
                 self._load_legacy_style_text(legacy_text)
         self.style_job_widget.load_settings(data.get("style_job", {}))
         self.text_job_widget.load_settings(data.get("text_job", {}))
+        self._style_job_history = data.get("style_job_history", [])
+        self._text_job_history = data.get("text_job_history", [])
         self.include_samples_check.setChecked(data.get("include_samples", False))
         if self.ass_input_edit.text().strip():
             try:
                 self._load_subtitle_events()
             except Exception as exc:
                 self._append_log(f"字幕事件加载失败：{exc}")
-        self._refresh_video_preview()
+        QTimer.singleShot(0, self._refresh_video_preview)
 
     def _save_settings(self) -> None:
         self.settings_store.save(
@@ -1102,6 +1155,8 @@ class MainWindow(QMainWindow):
                     "include_samples": self.include_samples_check.isChecked(),
                     "style_job": self.style_job_widget.dump_settings(),
                     "text_job": self.text_job_widget.dump_settings(),
+                    "style_job_history": self._style_job_history,
+                    "text_job_history": self._text_job_history,
                 }
             }
         )
