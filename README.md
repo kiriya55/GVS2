@@ -10,21 +10,18 @@ GVS2 主要用于衔接 [MagiaTimeline](https://github.com/HurryPeng/MagiaTimeli
 
 ## 快速开始
 
-```bash
-# 安装依赖
-pip install -r requirements.txt
+运行 `install.bat`（适用于 Windows）或 `install.sh`（适用于 GNU/Linux 或 macOS），自动将 `requirements.txt` 中列出的依赖项安装到 Python 虚拟环境中。
 
-# 启动主界面
-python app.py
-
-# 启动 benchmark 界面
-python benchmark_app.py
-```
+然后通过运行 `app.bat` 或 `app.sh`（适用于 GNU/Linux 或 macOS）启动主界面，或运行 `benchmark.bat` / `benchmark.sh` 启动 benchmark 界面。
 
 如果带一个 JSON 参数，则走命令行表格模式：
 
 ```bash
-python benchmark_app.py benchmark_samples.example.json
+# Windows
+benchmark.bat benchmark_samples.example.json
+
+# GNU/Linux 或 macOS
+./benchmark.sh benchmark_samples.example.json
 ```
 
 ## 依赖
@@ -102,7 +99,8 @@ setx GVS2_ANTHROPIC_MODEL "claude-opus-4-7"
 
 ### 预览与交互
 
-- 视频预览，百分比字幕区域遮罩
+- 视频预览，可在画面上拖拽绘制红框字幕区域，并通过拖动框体、边缘或角点随时调整
+- 字幕区域百分比信息（X / Y / W / H）
 - 字幕语言选择（自动识别 / 简中 / 繁中 / 日语 / 英语 / 韩语 / 混合）
 - **字幕事件跳转**：加载 ASS/SRT 后，可通过下拉框选择任意字幕事件直接跳转到对应时间点
 - 上一个 / 下一个字幕时点快速导航

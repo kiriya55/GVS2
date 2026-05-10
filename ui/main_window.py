@@ -5,8 +5,8 @@ import json
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QIcon, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -26,7 +26,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSlider,
-    QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -67,6 +66,203 @@ from ui.widgets import (
 WINDOW_TITLE = "GVS2"
 ICON_PATH = Path(__file__).resolve().parents[1] / "ico.ico"
 STYLE_SAMPLE_DIR = Path(__file__).resolve().parents[1] / "style_samples"
+
+
+class SubtitleRegionPreview(QLabel):
+    region_changed = Signal(dict)
+
+    HANDLE_SIZE = 10
+    MIN_REGION_PERCENT = 1.0
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self._frame_pixmap: QPixmap | None = None
+        self._region = {"x": 0.0, "y": 66.0, "width": 100.0, "height": 34.0}
+        self._drag_mode: str | None = None
+        self._drag_start = QPointF()
+        self._drag_origin = dict(self._region)
+        self.setMouseTracking(True)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(360, 220)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_frame(self, image: QImage | None) -> None:
+        self._frame_pixmap = QPixmap.fromImage(image) if image is not None and not image.isNull() else None
+        self.update()
+
+    def set_region(self, region: dict[str, float], *, emit: bool = False) -> None:
+        self._region = self._normalize_region(region)
+        self.update()
+        if emit:
+            self.region_changed.emit(dict(self._region))
+
+    def region(self) -> dict[str, float]:
+        return dict(self._region)
+
+    def _normalize_region(self, region: dict[str, float]) -> dict[str, float]:
+        x = float(region.get("x", 0.0))
+        y = float(region.get("y", 66.0))
+        width = float(region.get("width", 100.0))
+        height = float(region.get("height", 34.0))
+        x = max(0.0, min(100.0 - self.MIN_REGION_PERCENT, x))
+        y = max(0.0, min(100.0 - self.MIN_REGION_PERCENT, y))
+        width = max(self.MIN_REGION_PERCENT, min(100.0 - x, width))
+        height = max(self.MIN_REGION_PERCENT, min(100.0 - y, height))
+        return {"x": x, "y": y, "width": width, "height": height}
+
+    def _image_rect(self) -> QRectF:
+        if self._frame_pixmap is None or self._frame_pixmap.isNull():
+            return QRectF()
+        size = self._frame_pixmap.size()
+        scale = min(self.width() / size.width(), self.height() / size.height())
+        draw_width = size.width() * scale
+        draw_height = size.height() * scale
+        return QRectF((self.width() - draw_width) / 2, (self.height() - draw_height) / 2, draw_width, draw_height)
+
+    def _region_rect(self) -> QRectF:
+        image_rect = self._image_rect()
+        if image_rect.isNull():
+            return QRectF()
+        return QRectF(
+            image_rect.left() + image_rect.width() * self._region["x"] / 100,
+            image_rect.top() + image_rect.height() * self._region["y"] / 100,
+            image_rect.width() * self._region["width"] / 100,
+            image_rect.height() * self._region["height"] / 100,
+        )
+
+    def _point_to_percent(self, point: QPointF) -> tuple[float, float]:
+        image_rect = self._image_rect()
+        if image_rect.isNull():
+            return 0.0, 0.0
+        x = (point.x() - image_rect.left()) * 100 / image_rect.width()
+        y = (point.y() - image_rect.top()) * 100 / image_rect.height()
+        return max(0.0, min(100.0, x)), max(0.0, min(100.0, y))
+
+    def _hit_mode(self, point: QPointF) -> str | None:
+        rect = self._region_rect()
+        if rect.isNull():
+            return None
+        tolerance = self.HANDLE_SIZE
+        near_left = abs(point.x() - rect.left()) <= tolerance and rect.top() - tolerance <= point.y() <= rect.bottom() + tolerance
+        near_right = abs(point.x() - rect.right()) <= tolerance and rect.top() - tolerance <= point.y() <= rect.bottom() + tolerance
+        near_top = abs(point.y() - rect.top()) <= tolerance and rect.left() - tolerance <= point.x() <= rect.right() + tolerance
+        near_bottom = abs(point.y() - rect.bottom()) <= tolerance and rect.left() - tolerance <= point.x() <= rect.right() + tolerance
+        if near_left and near_top:
+            return "top-left"
+        if near_right and near_top:
+            return "top-right"
+        if near_left and near_bottom:
+            return "bottom-left"
+        if near_right and near_bottom:
+            return "bottom-right"
+        if near_left:
+            return "left"
+        if near_right:
+            return "right"
+        if near_top:
+            return "top"
+        if near_bottom:
+            return "bottom"
+        if rect.contains(point):
+            return "move"
+        if self._image_rect().contains(point):
+            return "draw"
+        return None
+
+    def _cursor_for_mode(self, mode: str | None) -> Qt.CursorShape:
+        return {
+            "move": Qt.SizeAllCursor,
+            "left": Qt.SizeHorCursor,
+            "right": Qt.SizeHorCursor,
+            "top": Qt.SizeVerCursor,
+            "bottom": Qt.SizeVerCursor,
+            "top-left": Qt.SizeFDiagCursor,
+            "bottom-right": Qt.SizeFDiagCursor,
+            "top-right": Qt.SizeBDiagCursor,
+            "bottom-left": Qt.SizeBDiagCursor,
+            "draw": Qt.CrossCursor,
+        }.get(mode, Qt.ArrowCursor)
+
+    def _resize_region(self, mode: str, x: float, y: float) -> dict[str, float]:
+        left = self._drag_origin["x"]
+        top = self._drag_origin["y"]
+        right = left + self._drag_origin["width"]
+        bottom = top + self._drag_origin["height"]
+        if "left" in mode:
+            left = min(x, right - self.MIN_REGION_PERCENT)
+        if "right" in mode:
+            right = max(x, left + self.MIN_REGION_PERCENT)
+        if "top" in mode:
+            top = min(y, bottom - self.MIN_REGION_PERCENT)
+        if "bottom" in mode:
+            bottom = max(y, top + self.MIN_REGION_PERCENT)
+        return self._normalize_region({"x": left, "y": top, "width": right - left, "height": bottom - top})
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.LeftButton or self._frame_pixmap is None:
+            return
+        point = QPointF(event.position())
+        self._drag_mode = self._hit_mode(point)
+        if self._drag_mode is None:
+            return
+        self._drag_start = point
+        self._drag_origin = dict(self._region)
+        if self._drag_mode == "draw":
+            x, y = self._point_to_percent(point)
+            self._region = self._normalize_region({"x": x, "y": y, "width": self.MIN_REGION_PERCENT, "height": self.MIN_REGION_PERCENT})
+            self._drag_origin = dict(self._region)
+        self.update()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        point = QPointF(event.position())
+        if self._drag_mode is None:
+            self.setCursor(self._cursor_for_mode(self._hit_mode(point)))
+            return
+        x, y = self._point_to_percent(point)
+        if self._drag_mode == "move":
+            start_x, start_y = self._point_to_percent(self._drag_start)
+            next_region = dict(self._drag_origin)
+            next_region["x"] += x - start_x
+            next_region["y"] += y - start_y
+            self._region = self._normalize_region(next_region)
+        elif self._drag_mode == "draw":
+            start_x = self._drag_origin["x"]
+            start_y = self._drag_origin["y"]
+            self._region = self._normalize_region(
+                {
+                    "x": min(start_x, x),
+                    "y": min(start_y, y),
+                    "width": abs(x - start_x),
+                    "height": abs(y - start_y),
+                }
+            )
+        else:
+            self._region = self._resize_region(self._drag_mode, x, y)
+        self.region_changed.emit(dict(self._region))
+        self.update()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton and self._drag_mode is not None:
+            self._drag_mode = None
+            self.region_changed.emit(dict(self._region))
+            self.update()
+
+    def paintEvent(self, event) -> None:
+        if self._frame_pixmap is None or self._frame_pixmap.isNull():
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        image_rect = self._image_rect()
+        painter.drawPixmap(image_rect, self._frame_pixmap, QRectF(self._frame_pixmap.rect()))
+        region_rect = self._region_rect()
+        painter.fillRect(image_rect, QColor(0, 0, 0, 90))
+        painter.fillRect(region_rect, QColor(255, 255, 255, 38))
+        painter.setPen(QPen(QColor(255, 70, 70), 2))
+        painter.drawRect(region_rect)
+        painter.setBrush(QColor(255, 70, 70))
+        for point in (region_rect.topLeft(), region_rect.topRight(), region_rect.bottomLeft(), region_rect.bottomRight()):
+            painter.drawRect(QRectF(point.x() - 4, point.y() - 4, 8, 8))
+        painter.end()
 
 
 class MainWindow(QMainWindow):
@@ -216,10 +412,8 @@ class MainWindow(QMainWindow):
     def _setup_preview_group(self, parent_layout: QVBoxLayout) -> None:
         preview_box = QGroupBox("视频预览")
         preview_layout = QVBoxLayout(preview_box)
-        self.preview_label = QLabel("选择视频后可预览字幕区域")
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumSize(360, 220)
-        self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview_label = SubtitleRegionPreview("选择视频后可预览字幕区域")
+        self.preview_label.region_changed.connect(self._on_region_changed)
         self.preview_time_slider = QSlider(Qt.Horizontal)
         self.preview_time_slider.setRange(0, 1000)
         self.preview_time_slider.setValue(500)
@@ -252,19 +446,12 @@ class MainWindow(QMainWindow):
     def _setup_region_group(self, parent_layout: QVBoxLayout) -> None:
         region_box = QGroupBox("字幕区域")
         region_form = QFormLayout()
-        self.region_start_spin = QSpinBox()
-        self.region_start_spin.setRange(0, 100)
-        self.region_start_spin.setValue(66)
-        self.region_end_spin = QSpinBox()
-        self.region_end_spin.setRange(0, 100)
-        self.region_end_spin.setValue(100)
+        self.subtitle_region_info_edit = QLineEdit()
+        self.subtitle_region_info_edit.setReadOnly(True)
         self.subtitle_language_combo = QComboBox()
         for value, label in SUBTITLE_LANGUAGES:
             self.subtitle_language_combo.addItem(label, value)
-        self.region_start_spin.valueChanged.connect(self._request_preview_refresh)
-        self.region_end_spin.valueChanged.connect(self._request_preview_refresh)
-        region_form.addRow("起始百分比", self.region_start_spin)
-        region_form.addRow("结束百分比", self.region_end_spin)
+        region_form.addRow("区域百分比", self.subtitle_region_info_edit)
         region_form.addRow("字幕语言", self.subtitle_language_combo)
         region_box.setLayout(region_form)
         parent_layout.addWidget(region_box)
@@ -378,9 +565,23 @@ class MainWindow(QMainWindow):
         return preprocess_for_llm(
             self.preview_frame_bytes,
             image_options,
-            start_percent=self.region_start_spin.value(),
-            end_percent=self.region_end_spin.value(),
+            region_rect=self._subtitle_region_rect(),
         )
+
+    def _subtitle_region_rect(self) -> dict[str, float]:
+        return self.preview_label.region()
+
+    def _subtitle_region_start_end(self) -> tuple[int, int]:
+        region = self._subtitle_region_rect()
+        start = int(round(region["y"]))
+        end = int(round(region["y"] + region["height"]))
+        return max(0, min(100, start)), max(0, min(100, end))
+
+    def _format_region_info(self, region: dict[str, float]) -> str:
+        return f"X {region['x']:.1f}%  Y {region['y']:.1f}%  W {region['width']:.1f}%  H {region['height']:.1f}%"
+
+    def _on_region_changed(self, region: dict) -> None:
+        self.subtitle_region_info_edit.setText(self._format_region_info(region))
 
     def _selected_preview_time_sec(self) -> float:
         duration = self._get_video_duration()
@@ -488,11 +689,14 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap.fromImage(image)
         painter = QPainter(pixmap)
         painter.fillRect(0, 0, pixmap.width(), pixmap.height(), QColor(0, 0, 0, 80))
-        top = int(pixmap.height() * self.region_start_spin.value() / 100)
-        bottom = int(pixmap.height() * self.region_end_spin.value() / 100)
-        painter.fillRect(0, top, pixmap.width(), max(1, bottom - top), QColor(255, 255, 255, 40))
+        region = self._subtitle_region_rect()
+        left = int(pixmap.width() * region["x"] / 100)
+        top = int(pixmap.height() * region["y"] / 100)
+        right = int(pixmap.width() * (region["x"] + region["width"]) / 100)
+        bottom = int(pixmap.height() * (region["y"] + region["height"]) / 100)
+        painter.fillRect(left, top, max(1, right - left), max(1, bottom - top), QColor(255, 255, 255, 40))
         painter.setPen(QPen(QColor(255, 80, 80), 3))
-        painter.drawRect(1, top, max(1, pixmap.width() - 2), max(1, bottom - top))
+        painter.drawRect(left, top, max(1, right - left), max(1, bottom - top))
         painter.end()
         return pixmap
 
@@ -502,21 +706,20 @@ class MainWindow(QMainWindow):
         self.preview_frame_bytes = None
         if not video_path:
             self.preview_label.setText("选择视频后可预览字幕区域")
-            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.set_frame(None)
             return
         frame_bytes = extract_frame_ffmpeg(video_path, self._selected_preview_time_sec())
         if not frame_bytes:
             self.preview_label.setText("预览截图失败，请检查 ffmpeg 和视频路径")
-            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.set_frame(None)
             return
         self.preview_frame_bytes = frame_bytes
-        pixmap = self._render_preview_pixmap(frame_bytes)
-        if pixmap is None:
+        image = QImage.fromData(frame_bytes)
+        if image.isNull():
             self.preview_label.setText("预览图像解码失败")
-            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.set_frame(None)
             return
-        scaled = pixmap.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.preview_label.setPixmap(scaled)
+        self.preview_label.set_frame(image)
 
     # ------------------------------------------------------------------
     # Style preparation
@@ -745,8 +948,7 @@ class MainWindow(QMainWindow):
             "subtitle_input_path": self.ass_input_edit.text().strip(),
             "timestamp_ms": timestamp_ms,
             "subtitle_language": self.subtitle_language_combo.currentData() or "auto",
-            "subtitle_region_start": self.region_start_spin.value(),
-            "subtitle_region_end": self.region_end_spin.value(),
+            "subtitle_region_rect": self._subtitle_region_rect(),
             "image_format": image_options.format_name,
             "quality": image_options.quality,
             "max_edge": image_options.max_edge,
@@ -924,10 +1126,10 @@ class MainWindow(QMainWindow):
             raise ValueError("字幕输入目前仅支持 ASS 或 SRT")
         if not ass_output_path:
             raise ValueError("请先填写 ASS 输出文件")
-        start = self.region_start_spin.value()
-        end = self.region_end_spin.value()
-        if start > end:
-            raise ValueError("字幕区域起始百分比不能大于结束百分比")
+        region_rect = self._subtitle_region_rect()
+        if region_rect["width"] <= 0 or region_rect["height"] <= 0:
+            raise ValueError("请在预览图中框选有效的字幕区域")
+        start, end = self._subtitle_region_start_end()
 
         style_provider = self.style_job_widget.build_provider_config()
         text_provider = self.text_job_widget.build_provider_config()
@@ -947,6 +1149,7 @@ class MainWindow(QMainWindow):
             text_provider=text_provider,
             subtitle_region_start=start,
             subtitle_region_end=end,
+            subtitle_region_rect=region_rect,
             subtitle_language=self.subtitle_language_combo.currentData() or "auto",
             style_image_options=self.style_job_widget.build_image_options(),
             text_image_options=self.text_job_widget.build_image_options(),
@@ -1111,8 +1314,13 @@ class MainWindow(QMainWindow):
         self.video_edit.setText(data.get("video_path", ""))
         self.ass_input_edit.setText(data.get("ass_input_path", ""))
         self.ass_output_edit.setText(data.get("ass_output_path", ""))
-        self.region_start_spin.setValue(int(data.get("subtitle_region_start", 66)))
-        self.region_end_spin.setValue(int(data.get("subtitle_region_end", 100)))
+        region_rect = data.get("subtitle_region_rect")
+        if not isinstance(region_rect, dict):
+            legacy_start = int(data.get("subtitle_region_start", 66))
+            legacy_end = int(data.get("subtitle_region_end", 100))
+            region_rect = {"x": 0.0, "y": float(legacy_start), "width": 100.0, "height": float(max(1, legacy_end - legacy_start))}
+        self.preview_label.set_region(region_rect)
+        self.subtitle_region_info_edit.setText(self._format_region_info(self._subtitle_region_rect()))
         subtitle_language = data.get("subtitle_language", "auto")
         language_index = self.subtitle_language_combo.findData(subtitle_language)
         self.subtitle_language_combo.setCurrentIndex(language_index if language_index >= 0 else 0)
@@ -1145,8 +1353,7 @@ class MainWindow(QMainWindow):
                     "video_path": self.video_edit.text().strip(),
                     "ass_input_path": self.ass_input_edit.text().strip(),
                     "ass_output_path": self.ass_output_edit.text().strip(),
-                    "subtitle_region_start": self.region_start_spin.value(),
-                    "subtitle_region_end": self.region_end_spin.value(),
+                    "subtitle_region_rect": self._subtitle_region_rect(),
                     "subtitle_language": self.subtitle_language_combo.currentData() or "auto",
                     "preview_time_ratio": self.preview_time_slider.value(),
                     "style_description_text": self.style_description_edit.toPlainText(),

@@ -10,6 +10,9 @@ output/
 
 # Executables and artifacts
 *.bat
+!install.bat
+!app.bat
+!benchmark.bat
 *.exe
 *.bak
 

@@ -23,6 +23,7 @@ def run_gvs2(
     text_provider: ProviderConfig | None = None,
     subtitle_region_start: int = 66,
     subtitle_region_end: int = 100,
+    subtitle_region_rect: dict[str, float] | None = None,
     subtitle_language: str = "auto",
     style_image_options: ImageEncodingOptions | None = None,
     text_image_options: ImageEncodingOptions | None = None,
@@ -49,6 +50,12 @@ def run_gvs2(
     settings = PipelineSettings(
         subtitle_region_start=subtitle_region_start,
         subtitle_region_end=subtitle_region_end,
+        subtitle_region_rect=subtitle_region_rect or {
+            "x": 0.0,
+            "y": float(subtitle_region_start),
+            "width": 100.0,
+            "height": float(max(0, subtitle_region_end - subtitle_region_start)),
+        },
         subtitle_language=subtitle_language,
         style_image_options=style_image_options or ImageEncodingOptions(),
         text_image_options=text_image_options or ImageEncodingOptions(max_edge=768),

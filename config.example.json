@@ -3,8 +3,12 @@
     "video_path": "/path/to/your/video.mp4",
     "ass_input_path": "/path/to/your/subtitles.ass",
     "ass_output_path": "/path/to/your/output.ass",
-    "subtitle_region_start": 80,
-    "subtitle_region_end": 100,
+    "subtitle_region_rect": {
+      "x": 0,
+      "y": 80,
+      "width": 100,
+      "height": 20
+    },
     "subtitle_language": "auto",
     "preview_time_ratio": 50,
     "style_description_text": "",

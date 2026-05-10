@@ -85,6 +85,7 @@ class RunPayload:
     text_provider: ProviderConfig | None
     subtitle_region_start: int
     subtitle_region_end: int
+    subtitle_region_rect: dict[str, float]
     subtitle_language: str
     style_image_options: ImageEncodingOptions
     text_image_options: ImageEncodingOptions
@@ -114,6 +115,7 @@ class PipelineWorker(QThread):
                 text_provider=self.payload.text_provider,
                 subtitle_region_start=self.payload.subtitle_region_start,
                 subtitle_region_end=self.payload.subtitle_region_end,
+                subtitle_region_rect=self.payload.subtitle_region_rect,
                 subtitle_language=self.payload.subtitle_language,
                 style_image_options=self.payload.style_image_options,
                 text_image_options=self.payload.text_image_options,

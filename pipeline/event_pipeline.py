@@ -35,6 +35,7 @@ class JobSettings:
 class PipelineSettings:
     subtitle_region_start: int = 66
     subtitle_region_end: int = 100
+    subtitle_region_rect: dict[str, float] = field(default_factory=lambda: {"x": 0.0, "y": 66.0, "width": 100.0, "height": 34.0})
     subtitle_language: str = "auto"
     style_image_options: ImageEncodingOptions = field(default_factory=ImageEncodingOptions)
     text_image_options: ImageEncodingOptions = field(default_factory=lambda: ImageEncodingOptions(max_edge=768))
@@ -103,6 +104,7 @@ class EventPipeline:
                     image_options,
                     start_percent=self.settings.subtitle_region_start,
                     end_percent=self.settings.subtitle_region_end,
+                    region_rect=self.settings.subtitle_region_rect,
                 )
             )
         return images
