@@ -19,7 +19,11 @@ def _extract_json(raw: str) -> dict:
     try:
         return json.loads(json_str)
     except json.JSONDecodeError:
-        sanitized = re.sub(r'[\x00-\x09\x0b\x0c\x0e-\x1f]', lambda m: f'\\u{ord(m.group(0)):04x}', json_str)
+        try:
+            return json.loads(json_str, strict=False)
+        except json.JSONDecodeError:
+            pass
+        sanitized = re.sub(r'[\x00-\x09\x0b\x0c\x0e-\x1f\r]', lambda m: f'\\u{ord(m.group(0)):04x}', json_str)
         return json.loads(sanitized)
 
 

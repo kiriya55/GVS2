@@ -31,3 +31,4 @@ class EventJobResult:
     text_result: Optional[TextJobResult] = None
     final_action: str = "skip"
     error_messages: list[str] = field(default_factory=list)
+    failed_tasks: list[str] = field(default_factory=list)

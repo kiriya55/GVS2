@@ -89,8 +89,10 @@ class RunPayload:
     subtitle_language: str
     style_image_options: ImageEncodingOptions
     text_image_options: ImageEncodingOptions
+    frame_concurrency: int = 5
     event_ids: set[str] | None = None
     include_samples: bool = False
+    failed_tasks_map: dict[str, list[str]] | None = None
 
 
 class PipelineWorker(QThread):
@@ -116,12 +118,14 @@ class PipelineWorker(QThread):
                 subtitle_region_start=self.payload.subtitle_region_start,
                 subtitle_region_end=self.payload.subtitle_region_end,
                 subtitle_region_rect=self.payload.subtitle_region_rect,
+                frame_concurrency=self.payload.frame_concurrency,
                 subtitle_language=self.payload.subtitle_language,
                 style_image_options=self.payload.style_image_options,
                 text_image_options=self.payload.text_image_options,
                 progress_callback=self.progress_changed.emit,
                 event_ids=self.payload.event_ids,
                 include_samples=self.payload.include_samples,
+                failed_tasks_map=self.payload.failed_tasks_map,
             )
         except Exception as exc:
             self.failed.emit(str(exc))

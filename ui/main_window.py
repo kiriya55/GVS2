@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSlider,
+    QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -280,6 +281,7 @@ class MainWindow(QMainWindow):
         self.loaded_events = []
         self.current_event_index = -1
         self.pending_retry_event_ids: set[str] | None = None
+        self.pending_retry_failed_tasks: dict[str, list[str]] | None = None
         self.api_settings_dialog = ApiSettingsDialog(self)
         self.style_job_widget = self.api_settings_dialog.style_job_widget
         self.text_job_widget = self.api_settings_dialog.text_job_widget
@@ -451,8 +453,13 @@ class MainWindow(QMainWindow):
         self.subtitle_language_combo = QComboBox()
         for value, label in SUBTITLE_LANGUAGES:
             self.subtitle_language_combo.addItem(label, value)
+        self.frame_concurrency_spin = QSpinBox()
+        self.frame_concurrency_spin.setRange(1, 12)
+        self.frame_concurrency_spin.setValue(5)
+        self.frame_concurrency_spin.setToolTip("控制预提取视频帧时同时运行的 ffmpeg 进程数；较高数值更快但更吃 CPU、磁盘和内存")
         region_form.addRow("区域百分比", self.subtitle_region_info_edit)
         region_form.addRow("字幕语言", self.subtitle_language_combo)
+        region_form.addRow("抽帧并发数", self.frame_concurrency_spin)
         region_box.setLayout(region_form)
         parent_layout.addWidget(region_box)
 
@@ -1150,11 +1157,13 @@ class MainWindow(QMainWindow):
             subtitle_region_start=start,
             subtitle_region_end=end,
             subtitle_region_rect=region_rect,
+            frame_concurrency=self.frame_concurrency_spin.value(),
             subtitle_language=self.subtitle_language_combo.currentData() or "auto",
             style_image_options=self.style_job_widget.build_image_options(),
             text_image_options=self.text_job_widget.build_image_options(),
             event_ids=self.pending_retry_event_ids,
             include_samples=self.include_samples_check.isChecked(),
+            failed_tasks_map=self.pending_retry_failed_tasks,
         )
 
     def _start_run(self) -> None:
@@ -1168,7 +1177,12 @@ class MainWindow(QMainWindow):
         self._save_settings()
         retry_count = len(self.pending_retry_event_ids) if self.pending_retry_event_ids else 0
         if retry_count:
-            self._append_log(f"开始复跑失败项… events={retry_count}")
+            task_summary = {}
+            if self.pending_retry_failed_tasks:
+                for tasks in self.pending_retry_failed_tasks.values():
+                    for t in tasks:
+                        task_summary[t] = task_summary.get(t, 0) + 1
+            self._append_log(f"开始复跑失败项… events={retry_count} 任务分布={task_summary}")
         else:
             self._append_log("开始运行 GVS2…")
         self.run_progress_bar.setValue(0)
@@ -1185,6 +1199,7 @@ class MainWindow(QMainWindow):
         self.run_button.setEnabled(True)
         self.retry_failed_button.setEnabled(self._failed_events_report_path() is not None and self._failed_events_report_path().exists())
         self.pending_retry_event_ids = None
+        self.pending_retry_failed_tasks = None
         self.worker = None
 
     def _update_run_progress(self, current: int, total: int, message: str) -> None:
@@ -1244,6 +1259,7 @@ class MainWindow(QMainWindow):
                     "original_style": event.original_style if event is not None else "",
                     "final_action": item.final_action,
                     "error_messages": item.error_messages,
+                    "failed_tasks": item.failed_tasks,
                 }
             )
         report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1263,6 +1279,17 @@ class MainWindow(QMainWindow):
         try:
             data = json.loads(report_path.read_text(encoding="utf-8"))
             event_ids = {str(item.get("event_id", "")).strip() for item in data if str(item.get("event_id", "")).strip()}
+            failed_tasks_map: dict[str, list[str]] = {}
+            for item in data:
+                eid = str(item.get("event_id", "")).strip()
+                if not eid:
+                    continue
+                tasks = item.get("failed_tasks")
+                if tasks:
+                    failed_tasks_map[eid] = tasks
+                else:
+                    # Legacy report without failed_tasks: assume both tasks failed
+                    failed_tasks_map[eid] = ["style", "text"]
         except Exception as exc:
             QMessageBox.critical(self, WINDOW_TITLE, f"读取失败事件清单失败：{exc}")
             return
@@ -1270,6 +1297,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, WINDOW_TITLE, "失败事件清单为空，暂无可复跑项。")
             return
         self.pending_retry_event_ids = event_ids
+        self.pending_retry_failed_tasks = failed_tasks_map
         self._append_log(f"准备复跑失败项：{len(event_ids)} 条")
         self._start_run()
 
@@ -1324,6 +1352,7 @@ class MainWindow(QMainWindow):
         subtitle_language = data.get("subtitle_language", "auto")
         language_index = self.subtitle_language_combo.findData(subtitle_language)
         self.subtitle_language_combo.setCurrentIndex(language_index if language_index >= 0 else 0)
+        self.frame_concurrency_spin.setValue(int(data.get("frame_concurrency", 5)))
         self.preview_time_slider.setValue(int(data.get("preview_time_ratio", 500)))
         self.style_description_edit.setPlainText(data.get("style_description_text", ""))
         self.style_compact_edit.setText(data.get("style_compact_text", ""))
@@ -1355,6 +1384,7 @@ class MainWindow(QMainWindow):
                     "ass_output_path": self.ass_output_edit.text().strip(),
                     "subtitle_region_rect": self._subtitle_region_rect(),
                     "subtitle_language": self.subtitle_language_combo.currentData() or "auto",
+                    "frame_concurrency": self.frame_concurrency_spin.value(),
                     "preview_time_ratio": self.preview_time_slider.value(),
                     "style_description_text": self.style_description_edit.toPlainText(),
                     "style_compact_text": self.style_compact_edit.text().strip(),

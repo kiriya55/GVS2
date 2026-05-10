@@ -24,12 +24,14 @@ def run_gvs2(
     subtitle_region_start: int = 66,
     subtitle_region_end: int = 100,
     subtitle_region_rect: dict[str, float] | None = None,
+    frame_concurrency: int = 5,
     subtitle_language: str = "auto",
     style_image_options: ImageEncodingOptions | None = None,
     text_image_options: ImageEncodingOptions | None = None,
     progress_callback=None,
     event_ids: set[str] | None = None,
     include_samples: bool = False,
+    failed_tasks_map: dict[str, list[str]] | None = None,
 ) -> list[EventJobResult]:
     logger.info(f"run_gvs2: 开始处理，视频={video_path}, 输入={ass_input_path}, 输出={ass_output_path}")
     logger.info(f"run_gvs2: 样式配置数={len(style_profiles)}, style_provider={'有' if style_provider else '无'}, text_provider={'有' if text_provider else '无'}")
@@ -56,6 +58,7 @@ def run_gvs2(
             "width": 100.0,
             "height": float(max(0, subtitle_region_end - subtitle_region_start)),
         },
+        frame_concurrency=frame_concurrency,
         subtitle_language=subtitle_language,
         style_image_options=style_image_options or ImageEncodingOptions(),
         text_image_options=text_image_options or ImageEncodingOptions(max_edge=768),
@@ -64,7 +67,8 @@ def run_gvs2(
     )
     pipeline = EventPipeline(settings)
     
-    if event_ids is not None:
+    keep_generated_document_whole = isinstance(document, GeneratedAssDocument) and failed_tasks_map is not None
+    if event_ids is not None and not keep_generated_document_whole:
         logger.info(f"run_gvs2: 指定重跑事件数={len(event_ids)}")
         document.events = [event for event in document.events if event.event_id in event_ids]
         if not document.events:
@@ -72,9 +76,11 @@ def run_gvs2(
         if getattr(document, "event_indices", None):
             document.event_indices = [event.line_index for event in document.events]
         logger.info(f"run_gvs2: 重跑模式，实际处理事件数={len(document.events)}")
+    elif event_ids is not None:
+        logger.info(f"run_gvs2: SRT复跑模式，保留完整输出事件数={len(document.events)}，指定复跑事件数={len(event_ids)}")
     
     logger.info(f"run_gvs2: 开始Pipeline处理，事件数={len(document.events)}")
-    results = pipeline.run(video_path, document, style_profiles, progress_callback=progress_callback)
+    results = pipeline.run(video_path, document, style_profiles, progress_callback=progress_callback, failed_tasks_map=failed_tasks_map)
     logger.info(f"run_gvs2: Pipeline处理完成，返回结果数={len(results)}")
     
     AssWriter().write(document, ass_output_path)

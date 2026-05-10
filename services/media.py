@@ -31,7 +31,7 @@ def _run_probe(cmd: list[str], label: str) -> str | None:
         return None
 
 
-def extract_frame_ffmpeg(video_path: str, time_sec: float) -> bytes | None:
+def extract_frame_ffmpeg(video_path: str, time_sec: float, timeout_sec: int = 30) -> bytes | None:
     cmd = [
         "ffmpeg",
         "-ss",
@@ -47,12 +47,15 @@ def extract_frame_ffmpeg(video_path: str, time_sec: float) -> bytes | None:
         "pipe:1",
     ]
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=_build_startupinfo(), check=False)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=_build_startupinfo(), check=False, timeout=timeout_sec)
         if result.returncode != 0:
             stderr_preview = result.stderr.decode("utf-8", errors="ignore")[:200]
             logger.warning("ffmpeg frame extraction failed (rc=%d): %s", result.returncode, stderr_preview)
             return None
         return result.stdout
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg frame extraction timed out after %ds for %.2fs", timeout_sec, time_sec)
+        return None
     except FileNotFoundError:
         logger.error("ffmpeg not found on PATH")
         return None

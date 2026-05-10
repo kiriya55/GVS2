@@ -10,6 +10,7 @@
       "height": 20
     },
     "subtitle_language": "auto",
+    "frame_concurrency": 5,
     "preview_time_ratio": 50,
     "style_description_text": "",
     "style_compact_text": "",

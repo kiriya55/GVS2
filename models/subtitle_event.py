@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import List
 
 REVIEW_STYLE_NAME = "需核查"
+REVIEW_TEXT_OVERRIDE = r"{\i1\c&H00FFFF&\3c&H000000&}"
 
 
 @dataclass(slots=True)
@@ -19,6 +20,7 @@ class SubtitleEvent:
     text: str
     original_style: str
     sample_times_ms: List[int] = field(default_factory=list)
+    text_prefix: str = ""
 
     @property
     def duration_ms(self) -> int:
@@ -49,8 +51,15 @@ class SubtitleEvent:
             idx = self.format_fields.index("Text")
         except ValueError:
             return
+        if self.text_prefix and not value.startswith(self.text_prefix):
+            value = self.text_prefix + value
         self.field_values[idx] = value
         self.text = value
+
+    def mark_review_text(self) -> None:
+        self.text_prefix = REVIEW_TEXT_OVERRIDE
+        if not self.text.startswith(REVIEW_TEXT_OVERRIDE):
+            self.set_text(self.text)
 
     def to_ass_line(self) -> str:
         return f"{self.event_type}: " + ",".join(self.field_values)

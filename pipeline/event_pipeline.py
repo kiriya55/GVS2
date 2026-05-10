@@ -10,7 +10,6 @@ import requests
 
 from models.job_result import EventJobResult
 from models.style_profile import StyleProfile, load_sample_images
-from models.subtitle_event import REVIEW_STYLE_NAME
 from providers.base import ProviderConfig
 from providers.factory import build_provider
 from providers.prompt_builder import build_style_job_prompt, build_text_job_prompt
@@ -36,6 +35,7 @@ class PipelineSettings:
     subtitle_region_start: int = 66
     subtitle_region_end: int = 100
     subtitle_region_rect: dict[str, float] = field(default_factory=lambda: {"x": 0.0, "y": 66.0, "width": 100.0, "height": 34.0})
+    frame_concurrency: int = 5
     subtitle_language: str = "auto"
     style_image_options: ImageEncodingOptions = field(default_factory=ImageEncodingOptions)
     text_image_options: ImageEncodingOptions = field(default_factory=lambda: ImageEncodingOptions(max_edge=768))
@@ -45,6 +45,7 @@ class PipelineSettings:
     def validate(self) -> None:
         if not self.style_job.enabled and not self.text_job.enabled:
             raise ValueError("at least one task must be enabled")
+        self.frame_concurrency = max(1, min(12, int(self.frame_concurrency)))
         if self.style_job.enabled and self.style_job.provider_config is None:
             raise ValueError("style task provider config is missing")
         if self.text_job.enabled and self.text_job.provider_config is None:
@@ -128,7 +129,8 @@ class EventPipeline:
                 match = next((profile for profile in style_profiles if profile.style_id == event_result.style_result.style_id), None)
                 if match is not None:
                     if event_result.style_result.review_required:
-                        event.style = REVIEW_STYLE_NAME
+                        event.style = match.ass_style_name
+                        event.mark_review_text()
                         event_result.final_action = "review_style"
                         logger.info(f"_process_style_event: {event.event_id} 匹配到样式 '{match.ass_style_name}', 需核查")
                     else:
@@ -140,10 +142,12 @@ class EventPipeline:
                     event_result.final_action = "skip"
             else:
                 logger.info(f"_process_style_event: {event.event_id} 未匹配到样式")
-                event_result.final_action = "skip"
+                event.style = "Default"
+                event_result.final_action = "default_style"
         except Exception as exc:
             logger.error(f"_process_style_event: {event.event_id} 处理失败: {exc}")
             event_result.error_messages.append(f"style_job: {exc}")
+            event_result.failed_tasks.append("style")
             if event_result.final_action == "skip":
                 event_result.final_action = "failed"
         return event_result
@@ -171,11 +175,12 @@ class EventPipeline:
         except Exception as exc:
             logger.error(f"_process_text_event: {event.event_id} 处理失败: {exc}")
             event_result.error_messages.append(f"text_job: {exc}")
+            event_result.failed_tasks.append("text")
             if event_result.final_action == "skip":
                 event_result.final_action = "failed"
         return event_result
 
-    _ACTION_PRIORITY = {"skip": 0, "failed": 1, "text_only": 2, "apply_style": 3, "review_style": 3}
+    _ACTION_PRIORITY = {"skip": 0, "failed": 1, "default_style": 2, "text_only": 2, "apply_style": 3, "review_style": 3}
 
     def _merge_results(self, base: EventJobResult, extra: EventJobResult) -> EventJobResult:
         if extra.style_result is not None:
@@ -187,30 +192,59 @@ class EventPipeline:
         if extra_p > base_p:
             base.final_action = extra.final_action
         base.error_messages.extend(extra.error_messages)
+        base.failed_tasks.extend(extra.failed_tasks)
         return base
 
-    def run(self, video_path: str, ass_document: AssDocument, style_profiles: list[StyleProfile], progress_callback=None) -> list[EventJobResult]:
+    def run(self, video_path: str, ass_document: AssDocument, style_profiles: list[StyleProfile], progress_callback=None, failed_tasks_map: dict[str, list[str]] | None = None) -> list[EventJobResult]:
         total = len(ass_document.events)
         logger.info(f"EventPipeline.run: 开始处理，视频={video_path}, 字幕数={total}")
         results_map = {event.event_id: EventJobResult(event_id=event.event_id) for event in ass_document.events}
         completed = 0
 
+        # When retrying, determine which events and tasks need processing
+        retry_event_ids: set[str] | None = None
+        if failed_tasks_map is not None:
+            retry_event_ids = set(failed_tasks_map.keys())
+            logger.info(f"run: 复跑模式，需要复跑的事件数={len(retry_event_ids)}")
+
+        def should_run_task(event_id: str, task_type: str) -> bool:
+            if failed_tasks_map is None:
+                return True
+            return event_id in failed_tasks_map and task_type in failed_tasks_map[event_id]
+
+        def should_process_event(event_id: str) -> bool:
+            if failed_tasks_map is None:
+                return True
+            return event_id in failed_tasks_map
+
         def emit_progress(message: str) -> None:
             if progress_callback is not None:
                 progress_callback(completed, total, message)
 
+        def emit_progress_value(current: int, message: str) -> None:
+            if progress_callback is not None:
+                progress_callback(current, total, message)
+
         # Pre-extract raw frames once when both phases are enabled to avoid duplicate ffmpeg calls
         frame_cache: dict[str, list[bytes]] = {}
         if self.style_provider is not None and self.text_provider is not None:
-            logger.info(f"run: 预提取帧，共 {total} 条")
-            emit_progress(f"预提取视频帧，共 {total} 条")
-            for event in ass_document.events:
-                frame_cache[event.event_id] = self._extract_raw_frames(video_path, event)
+            cache_events = [event for event in ass_document.events if should_process_event(event.event_id)]
+            frame_workers = self.settings.frame_concurrency
+            logger.info(f"run: 预提取帧，共 {len(cache_events)} 条，并发数={frame_workers}")
+            emit_progress(f"预提取视频帧，共 {len(cache_events)} 条")
+            with ThreadPoolExecutor(max_workers=frame_workers) as executor:
+                future_map = {executor.submit(self._extract_raw_frames, video_path, event): event for event in cache_events}
+                for index, future in enumerate(as_completed(future_map), start=1):
+                    event = future_map[future]
+                    frame_cache[event.event_id] = future.result()
+                    logger.info(f"run: 预提取帧 {index}/{len(cache_events)} event_id={event.event_id}")
+                    emit_progress_value(index, f"预提取视频帧 {index}/{len(cache_events)}")
             logger.info(f"run: 帧预提取完成")
 
         if self.style_provider is not None:
-            logger.info(f"run: 启动样式识别，共 {total} 条，并发数={max(1, self.style_provider.config.concurrency)}")
-            emit_progress(f"开始样式识别，共 {total} 条")
+            style_events = [event for event in ass_document.events if should_run_task(event.event_id, "style")]
+            logger.info(f"run: 启动样式识别，共 {len(style_events)} 条，并发数={max(1, self.style_provider.config.concurrency)}")
+            emit_progress(f"开始样式识别，共 {len(style_events)} 条")
             sample_images: list[tuple[str, str]] = []
             if self.settings.style_job.include_samples:
                 raw_samples = load_sample_images(style_profiles)
@@ -220,27 +254,28 @@ class EventPipeline:
                     logger.info(f"run: 已加载 {len(sample_images)} 张样式样本图作为 few-shot 参考")
             max_workers = max(1, self.style_provider.config.concurrency)
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_map = {executor.submit(self._process_style_event, video_path, event, style_profiles, sample_images, frame_cache.get(event.event_id)): event for event in ass_document.events}
+                future_map = {executor.submit(self._process_style_event, video_path, event, style_profiles, sample_images, frame_cache.get(event.event_id)): event for event in style_events}
                 for future in as_completed(future_map):
                     event_result = future.result()
                     self._merge_results(results_map[event_result.event_id], event_result)
                     completed += 1
                     emit_progress(f"样式识别进度 {completed}/{total}")
-            logger.info(f"run: 样式识别完成，已处理 {completed}/{total}")
+            logger.info(f"run: 样式识别完成，已处理 {completed}/{len(style_events)}")
 
         completed = 0
         if self.text_provider is not None:
-            logger.info(f"run: 启动文字提取，共 {total} 条，并发数={max(1, self.text_provider.config.concurrency)}")
-            emit_progress(f"开始文字提取，共 {total} 条")
+            text_events = [event for event in ass_document.events if should_run_task(event.event_id, "text")]
+            logger.info(f"run: 启动文字提取，共 {len(text_events)} 条，并发数={max(1, self.text_provider.config.concurrency)}")
+            emit_progress(f"开始文字提取，共 {len(text_events)} 条")
             max_workers = max(1, self.text_provider.config.concurrency)
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_map = {executor.submit(self._process_text_event, video_path, event, frame_cache.get(event.event_id)): event for event in ass_document.events}
+                future_map = {executor.submit(self._process_text_event, video_path, event, frame_cache.get(event.event_id)): event for event in text_events}
                 for future in as_completed(future_map):
                     event_result = future.result()
                     self._merge_results(results_map[event_result.event_id], event_result)
                     completed += 1
                     emit_progress(f"文字提取进度 {completed}/{total}")
-            logger.info(f"run: 文字提取完成，已处理 {completed}/{total}")
+            logger.info(f"run: 文字提取完成，已处理 {completed}/{len(text_events)}")
 
         action_counts = {}
         error_count = 0
