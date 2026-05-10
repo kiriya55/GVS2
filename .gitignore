@@ -28,6 +28,7 @@ test*.py
 
 # Personal config (use config.example.json as template)
 config.json
+storage/jobs/
 
 # Workspace files
 .workbuddy/

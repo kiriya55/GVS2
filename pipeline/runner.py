@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+
 from models.job_result import EventJobResult
 from models.style_profile import StyleProfile
 from pipeline.event_pipeline import EventPipeline, JobSettings, PipelineSettings
@@ -35,8 +37,18 @@ def run_gvs2(
 ) -> list[EventJobResult]:
     logger.info(f"run_gvs2: 开始处理，视频={video_path}, 输入={ass_input_path}, 输出={ass_output_path}")
     logger.info(f"run_gvs2: 样式配置数={len(style_profiles)}, style_provider={'有' if style_provider else '无'}, text_provider={'有' if text_provider else '无'}")
-    
-    document = parse_subtitle_document(ass_input_path)
+
+    input_path = Path(ass_input_path)
+    output_path = Path(ass_output_path)
+    retry_mode = failed_tasks_map is not None
+    retry_from_srt = retry_mode and input_path.suffix.lower() == ".srt"
+    using_existing_output_base = False
+    if retry_mode and output_path.suffix.lower() == ".ass" and output_path.exists():
+        logger.info(f"run_gvs2: 复跑模式，使用已有输出ASS作为基底={ass_output_path}")
+        document = parse_subtitle_document(ass_output_path)
+        using_existing_output_base = True
+    else:
+        document = parse_subtitle_document(ass_input_path)
     logger.info(f"run_gvs2: 解析完成，输入字幕数={len(document.events)}")
     
     if isinstance(document, GeneratedAssDocument):
@@ -67,8 +79,11 @@ def run_gvs2(
     )
     pipeline = EventPipeline(settings)
     
-    keep_generated_document_whole = isinstance(document, GeneratedAssDocument) and failed_tasks_map is not None
-    if event_ids is not None and not keep_generated_document_whole:
+    keep_document_whole = (
+        failed_tasks_map is not None
+        and (isinstance(document, GeneratedAssDocument) or using_existing_output_base or retry_from_srt)
+    )
+    if event_ids is not None and not keep_document_whole:
         logger.info(f"run_gvs2: 指定重跑事件数={len(event_ids)}")
         document.events = [event for event in document.events if event.event_id in event_ids]
         if not document.events:

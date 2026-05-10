@@ -1,5 +1,7 @@
 import unittest
 from concurrent.futures import ThreadPoolExecutor as RealThreadPoolExecutor
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 from types import SimpleNamespace
 
@@ -131,6 +133,103 @@ class RetryRunnerTests(unittest.TestCase):
 
         self.assertEqual(processed_counts, [3])
         self.assertEqual(written_counts, [3])
+
+    def test_srt_retry_uses_existing_ass_output_as_base_document(self) -> None:
+        srt_events = [make_event(f"event-{index + 1}", index) for index in range(3)]
+        generated_document = GeneratedAssDocument(srt_events)
+        existing_events = [make_event(f"event-{index + 1}", index) for index in range(3)]
+        for event in existing_events:
+            event.style = "MatchedStyle"
+            event.set_text(f"recognized {event.index}")
+        existing_document = AssDocument(lines=[], event_indices=[], events=existing_events)
+        processed_styles: list[list[str]] = []
+        written_styles: list[list[str]] = []
+
+        class FakePipeline:
+            def __init__(self, _settings) -> None:
+                pass
+
+            def run(self, _video_path, ass_document, _style_profiles, progress_callback=None, failed_tasks_map=None):
+                processed_styles.append([event.style for event in ass_document.events])
+                return []
+
+        class FakeWriter:
+            def write(self, ass_document, _output_path):
+                written_styles.append([event.style for event in ass_document.events])
+                return _output_path
+
+        with TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "output.ass"
+            output_path.write_text("", encoding="utf-8")
+
+            def parse_by_path(path: str):
+                return existing_document if Path(path) == output_path else generated_document
+
+            with (
+                patch("pipeline.runner.parse_subtitle_document", side_effect=parse_by_path),
+                patch("pipeline.runner.EventPipeline", FakePipeline),
+                patch("pipeline.runner.AssWriter", FakeWriter),
+            ):
+                run_gvs2(
+                    video_path="video.mp4",
+                    ass_input_path="input.srt",
+                    ass_output_path=str(output_path),
+                    style_profiles=[],
+                    style_provider=None,
+                    text_provider=ProviderConfig(provider_type="openai", model="test", api_key="key"),
+                    event_ids={"event-2"},
+                    failed_tasks_map={"event-2": ["text"]},
+                )
+
+        self.assertEqual(processed_styles, [["MatchedStyle", "MatchedStyle", "MatchedStyle"]])
+        self.assertEqual(written_styles, [["MatchedStyle", "MatchedStyle", "MatchedStyle"]])
+
+    def test_ass_retry_uses_existing_output_ass_as_base_document(self) -> None:
+        input_events = [make_event(f"event-{index + 1}", index) for index in range(3)]
+        input_document = AssDocument(lines=[], event_indices=[], events=input_events)
+        output_events = [make_event(f"event-{index + 1}", index) for index in range(3)]
+        for event in output_events:
+            event.style = "ProcessedStyle"
+            event.set_text(f"processed {event.index}")
+        output_document = AssDocument(lines=[], event_indices=[], events=output_events)
+        processed_texts: list[list[str]] = []
+
+        class FakePipeline:
+            def __init__(self, _settings) -> None:
+                pass
+
+            def run(self, _video_path, ass_document, _style_profiles, progress_callback=None, failed_tasks_map=None):
+                processed_texts.append([event.text for event in ass_document.events])
+                return []
+
+        class FakeWriter:
+            def write(self, ass_document, _output_path):
+                return _output_path
+
+        with TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "output.ass"
+            output_path.write_text("", encoding="utf-8")
+
+            def parse_by_path(path: str):
+                return output_document if Path(path) == output_path else input_document
+
+            with (
+                patch("pipeline.runner.parse_subtitle_document", side_effect=parse_by_path),
+                patch("pipeline.runner.EventPipeline", FakePipeline),
+                patch("pipeline.runner.AssWriter", FakeWriter),
+            ):
+                run_gvs2(
+                    video_path="video.mp4",
+                    ass_input_path="input.ass",
+                    ass_output_path=str(output_path),
+                    style_profiles=[],
+                    style_provider=None,
+                    text_provider=ProviderConfig(provider_type="openai", model="test", api_key="key"),
+                    event_ids={"event-2"},
+                    failed_tasks_map={"event-2": ["text"]},
+                )
+
+        self.assertEqual(processed_texts, [["processed 0", "processed 1", "processed 2"]])
 
 
 class ResponseParserTests(unittest.TestCase):

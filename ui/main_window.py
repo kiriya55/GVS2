@@ -48,6 +48,7 @@ from providers.prompt_builder import (
 from services.image_preprocess import preprocess_for_llm
 from services.media import extract_frame_ffmpeg, probe_video_duration_ffprobe
 from services.subtitle_parser import parse_ass_styles, parse_subtitle_document
+from storage.job_store import JobStore
 from storage.settings_store import SettingsStore
 from ui.widgets import (
     CONFIG_PATH,
@@ -274,6 +275,7 @@ class MainWindow(QMainWindow):
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.settings_store = SettingsStore(str(CONFIG_PATH))
+        self.job_store = JobStore()
         self.worker: PipelineWorker | None = None
         self.style_prep_worker: StylePrepWorker | None = None
         self.style_prep_mode = ""
@@ -1197,7 +1199,7 @@ class MainWindow(QMainWindow):
 
     def _clear_worker(self) -> None:
         self.run_button.setEnabled(True)
-        self.retry_failed_button.setEnabled(self._failed_events_report_path() is not None and self._failed_events_report_path().exists())
+        self.retry_failed_button.setEnabled(self._has_retryable_job())
         self.pending_retry_event_ids = None
         self.pending_retry_failed_tasks = None
         self.worker = None
@@ -1220,16 +1222,16 @@ class MainWindow(QMainWindow):
         self._append_log(
             f"处理完成。events={len(results)} style_hits={style_hits} review_hits={review_hits} text_hits={text_hits} no_subtitle={no_subtitle} failed={len(failed_events)} {usage_summary} 输出={self.ass_output_edit.text().strip()}"
         )
+        job_path = self._write_job_record(results)
+        if job_path:
+            self._append_log(f"任务状态已保存：{job_path}")
         if review_hits:
             self._append_log(f"其中 {review_hits} 条样式已标记为“需核查”。")
         if no_subtitle:
             self._append_log(f"其中 {no_subtitle} 条文字识别结果为未识别到字幕。")
         if failed_events:
-            report_path = self._write_failed_events_report(failed_events)
-            self.retry_failed_button.setEnabled(bool(report_path))
+            self.retry_failed_button.setEnabled(True)
             self._append_log(f"其中 {len(failed_events)} 条字幕处理失败，已跳过并继续后续任务。")
-            if report_path:
-                self._append_log(f"失败清单已导出：{report_path}")
             for item in failed_events[:5]:
                 self._append_log(f"失败 {item.event_id}: {' | '.join(item.error_messages)}")
         else:
@@ -1240,6 +1242,36 @@ class MainWindow(QMainWindow):
         self.run_progress_label.setText("处理失败")
         self._append_log(f"处理失败：{message}")
         QMessageBox.critical(self, WINDOW_TITLE, message)
+
+    def _write_job_record(self, results: list[EventJobResult]) -> str | None:
+        if self.worker is None:
+            return None
+        payload = self.worker.payload
+        if not payload.ass_output_path:
+            return None
+        event_lookup = {event.event_id: event for event in self.loaded_events}
+        record = self.job_store.save_run(
+            video_path=payload.video_path,
+            subtitle_input_path=payload.ass_input_path,
+            ass_output_path=payload.ass_output_path,
+            results=results,
+            event_lookup=event_lookup,
+            previous_record=self.job_store.load_latest_for_output(payload.ass_output_path),
+        )
+        return str(self.job_store.path_for(record["job_id"]))
+
+    def _latest_job_record(self) -> dict:
+        output_path = self.ass_output_edit.text().strip()
+        if not output_path:
+            return {}
+        return self.job_store.load_latest_for_output(output_path)
+
+    def _has_retryable_job(self) -> bool:
+        record = self._latest_job_record()
+        if self.job_store.failed_tasks_map(record):
+            return True
+        report_path = self._failed_events_report_path()
+        return report_path is not None and report_path.exists()
 
     def _write_failed_events_report(self, failed_events: list[EventJobResult]) -> str | None:
         output_path = self.ass_output_edit.text().strip()
@@ -1272,29 +1304,34 @@ class MainWindow(QMainWindow):
         return Path(output_path).with_name(Path(output_path).stem + "_failed_events.json")
 
     def _retry_failed_events(self) -> None:
-        report_path = self._failed_events_report_path()
-        if report_path is None or not report_path.exists():
-            QMessageBox.warning(self, WINDOW_TITLE, "未找到失败事件清单，请先完成一次包含失败项的运行。")
-            return
-        try:
-            data = json.loads(report_path.read_text(encoding="utf-8"))
-            event_ids = {str(item.get("event_id", "")).strip() for item in data if str(item.get("event_id", "")).strip()}
-            failed_tasks_map: dict[str, list[str]] = {}
-            for item in data:
-                eid = str(item.get("event_id", "")).strip()
-                if not eid:
-                    continue
-                tasks = item.get("failed_tasks")
-                if tasks:
-                    failed_tasks_map[eid] = tasks
-                else:
-                    # Legacy report without failed_tasks: assume both tasks failed
-                    failed_tasks_map[eid] = ["style", "text"]
-        except Exception as exc:
-            QMessageBox.critical(self, WINDOW_TITLE, f"读取失败事件清单失败：{exc}")
-            return
+        record = self._latest_job_record()
+        failed_tasks_map = self.job_store.failed_tasks_map(record)
+        if failed_tasks_map:
+            event_ids = set(failed_tasks_map.keys())
+        else:
+            report_path = self._failed_events_report_path()
+            if report_path is None or not report_path.exists():
+                QMessageBox.warning(self, WINDOW_TITLE, "未找到失败事件清单，请先完成一次包含失败项的运行。")
+                return
+            try:
+                data = json.loads(report_path.read_text(encoding="utf-8"))
+                event_ids = {str(item.get("event_id", "")).strip() for item in data if str(item.get("event_id", "")).strip()}
+                failed_tasks_map = {}
+                for item in data:
+                    eid = str(item.get("event_id", "")).strip()
+                    if not eid:
+                        continue
+                    tasks = item.get("failed_tasks")
+                    if tasks:
+                        failed_tasks_map[eid] = tasks
+                    else:
+                        # Legacy report without failed_tasks: assume both tasks failed
+                        failed_tasks_map[eid] = ["style", "text"]
+            except Exception as exc:
+                QMessageBox.critical(self, WINDOW_TITLE, f"读取失败事件清单失败：{exc}")
+                return
         if not event_ids:
-            QMessageBox.warning(self, WINDOW_TITLE, "失败事件清单为空，暂无可复跑项。")
+            QMessageBox.warning(self, WINDOW_TITLE, "未找到失败事件清单，请先完成一次包含失败项的运行。")
             return
         self.pending_retry_event_ids = event_ids
         self.pending_retry_failed_tasks = failed_tasks_map
