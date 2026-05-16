@@ -109,8 +109,11 @@ def build_text_job_prompt(event: SubtitleEvent, subtitle_language: str = "auto")
         f"{_build_language_instruction(subtitle_language)}\n"
         "Preserve visible punctuation, spacing, and line breaks when reliable.\n"
         "Do not summarize, rewrite, or normalize the text.\n"
+        "If the subtitle is very long, clipped by the image edge, partially missing, or only partially readable, return the best visible text and include \"r\":1 for human review.\n"
+        "Do not hallucinate hidden or clipped characters beyond what is visible.\n"
         f"If no reliable subtitle text can be extracted, return exactly {NO_MATCH_JSON}.\n"
-        'If matched, return exactly this shape: {"m":1,"t":"subtitle text"}.\n'
+        'If matched normally, return exactly this shape: {"m":1,"t":"subtitle text"}.\n'
+        'If matched but human review is needed, return exactly this shape: {"m":1,"t":"subtitle text","r":1}.\n'
         f"Current ASS subtitle text for reference only: {event.text}"
     )
 
@@ -122,7 +125,9 @@ def build_text_dry_run_prompt(subtitle_language: str = "auto") -> str:
         f"{_build_language_instruction(subtitle_language)}\n"
         "Preserve visible punctuation, spacing, and line breaks when reliable.\n"
         "Do not summarize, rewrite, or normalize the text.\n"
+        "If only part of the subtitle is visible, return the visible text only and include \"r\":1.\n"
         'If subtitle text is clearly visible, return exactly this shape: {"m":1,"t":"subtitle text"}.\n'
+        'If human review is needed, return exactly this shape: {"m":1,"t":"subtitle text","r":1}.\n'
         f"If there is no subtitle in the selected region, return exactly {TEXT_DRY_RUN_NO_MATCH_JSON}.\n"
-        "If only part of the subtitle is visible, infer conservatively and return the most likely full text."
+        "Do not infer hidden or clipped characters beyond what is visible."
     )

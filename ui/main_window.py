@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -35,9 +36,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from models.job_result import EventJobResult
+from models.job_result import EventJobResult, TextJobResult
 from models.style_profile import StyleProfile, StyleSample
-from models.subtitle_event import SubtitleEvent
+from models.subtitle_event import REVIEW_TEXT_OVERRIDE, SubtitleEvent
 from providers.base import ProviderResponse, ProviderUsage
 from providers.prompt_builder import (
     build_style_image_analysis_prompt,
@@ -47,7 +48,8 @@ from providers.prompt_builder import (
 )
 from services.image_preprocess import preprocess_for_llm
 from services.media import extract_frame_ffmpeg, probe_video_duration_ffprobe
-from services.subtitle_parser import parse_ass_styles, parse_subtitle_document
+from services.ass_writer import AssWriter
+from services.subtitle_parser import extract_ass_style_section, parse_ass_styles, parse_subtitle_document
 from storage.job_store import JobStore
 from storage.settings_store import SettingsStore
 from ui.widgets import (
@@ -267,6 +269,376 @@ class SubtitleRegionPreview(QLabel):
         painter.end()
 
 
+class RunSummaryDialog(QDialog):
+    def __init__(self, parent: QWidget, payload: RunPayload, event_count: int, retry_count: int, output_exists: bool, style_section_source: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("运行前确认")
+        self.resize(720, 520)
+        self.use_output_style_override = bool(payload.output_style_section_lines)
+
+        layout = QVBoxLayout(self)
+        title = QLabel("请确认本次运行计划")
+        title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        layout.addWidget(title)
+
+        form = QFormLayout()
+        tasks = []
+        if payload.style_provider is not None:
+            tasks.append(f"样式识别 / {payload.style_provider.model} / 并发 {payload.style_provider.concurrency}")
+        if payload.text_provider is not None:
+            tasks.append(f"文字提取 / {payload.text_provider.model} / 并发 {payload.text_provider.concurrency}")
+        form.addRow("任务", QLabel("；".join(tasks) if tasks else "未启用"))
+        form.addRow("处理范围", QLabel(f"复跑 {retry_count} 条事件" if retry_count else f"全量 {event_count} 条事件"))
+        form.addRow("字幕区域", QLabel(self._format_region(payload.subtitle_region_rect)))
+        form.addRow("字幕语言", QLabel(payload.subtitle_language))
+        form.addRow("抽帧并发", QLabel(str(payload.frame_concurrency)))
+        form.addRow("样式样本", QLabel("启用" if payload.include_samples else "未启用"))
+        form.addRow("输出文件", QLabel(payload.ass_output_path + ("（将覆盖已有文件）" if output_exists else "")))
+        layout.addLayout(form)
+
+        self.override_check = QCheckBox("用导入 ASS 的 [V4+ Styles] 覆盖输出样式段")
+        self.override_check.setChecked(self.use_output_style_override)
+        self.override_check.setEnabled(bool(payload.output_style_section_lines))
+        if style_section_source:
+            self.override_check.setToolTip(style_section_source)
+        self.override_check.toggled.connect(lambda checked: setattr(self, "use_output_style_override", checked))
+        layout.addWidget(self.override_check)
+
+        details = QPlainTextEdit()
+        details.setReadOnly(True)
+        details.setMaximumHeight(130)
+        details.setPlainText(
+            "\n".join(
+                [
+                    f"视频：{payload.video_path}",
+                    f"输入字幕：{payload.ass_input_path}",
+                    f"输出样式段来源：{style_section_source or '不覆盖'}",
+                    f"样式图片：{payload.style_image_options.format_name} max_edge={payload.style_image_options.max_edge} q={payload.style_image_options.quality}",
+                    f"文字图片：{payload.text_image_options.format_name} max_edge={payload.text_image_options.max_edge} q={payload.text_image_options.quality}",
+                ]
+            )
+        )
+        layout.addWidget(details)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        cancel_button = QPushButton("取消")
+        cancel_button.clicked.connect(self.reject)
+        start_button = QPushButton("开始运行")
+        start_button.setDefault(True)
+        start_button.clicked.connect(self.accept)
+        actions.addWidget(cancel_button)
+        actions.addWidget(start_button)
+        layout.addLayout(actions)
+
+    def _format_region(self, region: dict[str, float]) -> str:
+        return f"X {region.get('x', 0):.1f}% / Y {region.get('y', 0):.1f}% / W {region.get('width', 0):.1f}% / H {region.get('height', 0):.1f}%"
+
+
+class ResultReviewDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget,
+        output_path: str,
+        results: list[EventJobResult],
+        style_profiles: list[StyleProfile],
+        video_path: str = "",
+        subtitle_region_rect: dict[str, float] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("结果审查工作台")
+        self.resize(1280, 760)
+        self.output_path = output_path
+        self.video_path = video_path
+        self.subtitle_region_rect = subtitle_region_rect or {"x": 0.0, "y": 66.0, "width": 100.0, "height": 34.0}
+        self.results = results
+        self.result_map = {result.event_id: result for result in results}
+        self.style_profiles = style_profiles
+        self.retry_failed_tasks_map: dict[str, list[str]] | None = None
+        self.applied_style_event_ids: set[str] = set()
+        self.document = parse_subtitle_document(output_path) if output_path and Path(output_path).exists() else None
+        self.events = self.document.events if self.document is not None else []
+        self.event_map = {event.event_id: event for event in self.events}
+        self.row_event_ids: list[str] = []
+        self.style_combos: dict[str, QComboBox] = {}
+        self.preview_cache: dict[str, QImage | None] = {}
+
+        layout = QVBoxLayout(self)
+        summary = QLabel(self._summary_text())
+        summary.setStyleSheet("font-size: 15px; font-weight: 600;")
+        layout.addWidget(summary)
+
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("筛选"))
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(["需处理", "需核查样式", "文字需核查", "文字失败", "全部"])
+        self.filter_combo.currentIndexChanged.connect(self._populate_table)
+        toolbar.addWidget(self.filter_combo)
+        toolbar.addStretch(1)
+        apply_button = QPushButton("应用样式修正")
+        apply_button.clicked.connect(self._apply_style_fixes)
+        retry_selected_button = QPushButton("复跑选中文字失败")
+        retry_selected_button.clicked.connect(self._retry_selected_text_failures)
+        retry_all_button = QPushButton("复跑全部文字失败")
+        retry_all_button.clicked.connect(self._retry_all_text_failures)
+        toolbar.addWidget(apply_button)
+        toolbar.addWidget(retry_selected_button)
+        toolbar.addWidget(retry_all_button)
+        layout.addLayout(toolbar)
+
+        splitter = QSplitter(Qt.Horizontal)
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["事件", "时间", "状态", "当前样式", "人工输出样式", "字幕文本", "错误"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.itemSelectionChanged.connect(self._refresh_preview)
+        left_layout.addWidget(self.table, 1)
+        splitter.addWidget(left_panel)
+
+        preview_panel = QGroupBox("选中事件预览")
+        preview_layout = QVBoxLayout(preview_panel)
+        self.preview_title = QLabel("选择一条记录查看画面和输出内容")
+        self.preview_title.setStyleSheet("font-size: 14px; font-weight: 600;")
+        preview_layout.addWidget(self.preview_title)
+        self.preview_frame = SubtitleRegionPreview("选择一条记录后预览视频帧")
+        self.preview_frame.setMinimumSize(360, 240)
+        self.preview_frame.set_region(self.subtitle_region_rect)
+        preview_layout.addWidget(self.preview_frame, 1)
+        self.preview_details = QPlainTextEdit()
+        self.preview_details.setReadOnly(True)
+        self.preview_details.setMaximumHeight(180)
+        preview_layout.addWidget(self.preview_details)
+        splitter.addWidget(preview_panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter, 1)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+        self._populate_table()
+        if self.table.rowCount() > 0:
+            self.table.selectRow(0)
+
+    def _summary_text(self) -> str:
+        review_count = sum(1 for result in self.results if result.style_result and result.style_result.review_required)
+        text_review_count = sum(1 for result in self.results if result.text_result and result.text_result.review_required)
+        text_failed_count = sum(1 for result in self.results if "text" in result.failed_tasks)
+        failed_count = sum(1 for result in self.results if result.error_messages)
+        return f"需核查样式 {review_count} 条 / 文字需核查 {text_review_count} 条 / 文字失败 {text_failed_count} 条 / 总失败 {failed_count} 条 / 输出 {self.output_path}"
+
+    def _event_time(self, event: SubtitleEvent | None) -> str:
+        if event is None:
+            return ""
+        return f"{event.start_ms / 1000:.2f}s - {event.end_ms / 1000:.2f}s"
+
+    def _needs_review(self, event_id: str) -> bool:
+        result = self.result_map.get(event_id)
+        event = self.event_map.get(event_id)
+        if event_id in self.applied_style_event_ids:
+            return False
+        if event is not None:
+            return event.text.startswith(REVIEW_TEXT_OVERRIDE)
+        return bool(result and result.style_result and result.style_result.review_required)
+
+    def _is_text_failed(self, event_id: str) -> bool:
+        result = self.result_map.get(event_id)
+        return bool(result and "text" in result.failed_tasks)
+
+    def _is_text_review_required(self, event_id: str) -> bool:
+        result = self.result_map.get(event_id)
+        return bool(result and result.text_result and result.text_result.review_required)
+
+    def _status_text(self, event_id: str) -> str:
+        parts = []
+        if event_id in self.applied_style_event_ids:
+            parts.append("样式已修正")
+        elif self._needs_review(event_id):
+            parts.append("需核查样式")
+        if self._is_text_review_required(event_id):
+            parts.append("文字需核查")
+        if self._is_text_failed(event_id):
+            parts.append("文字失败")
+        result = self.result_map.get(event_id)
+        if result and "style" in result.failed_tasks:
+            parts.append("样式失败")
+        return " / ".join(parts) or "已处理"
+
+    def _include_event(self, event_id: str) -> bool:
+        mode = self.filter_combo.currentText()
+        if mode == "全部":
+            return True
+        if mode == "需核查样式":
+            return self._needs_review(event_id)
+        if mode == "文字需核查":
+            return self._is_text_review_required(event_id)
+        if mode == "文字失败":
+            return self._is_text_failed(event_id)
+        return self._needs_review(event_id) or self._is_text_review_required(event_id) or self._is_text_failed(event_id) or bool(self.result_map.get(event_id, EventJobResult(event_id)).error_messages)
+
+    def _set_item(self, row: int, column: int, value: str) -> None:
+        item = QTableWidgetItem(value)
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        self.table.setItem(row, column, item)
+
+    def _selected_event_id(self) -> str | None:
+        selected_rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        if not selected_rows:
+            return None
+        row = selected_rows[0]
+        if row >= len(self.row_event_ids):
+            return None
+        return self.row_event_ids[row]
+
+    def _preview_image_for_event(self, event: SubtitleEvent) -> QImage | None:
+        cached = self.preview_cache.get(event.event_id)
+        if event.event_id in self.preview_cache:
+            return cached
+        if not self.video_path:
+            self.preview_cache[event.event_id] = None
+            return None
+        frame_bytes = extract_frame_ffmpeg(self.video_path, event.midpoint_ms / 1000, timeout_sec=8)
+        if not frame_bytes:
+            self.preview_cache[event.event_id] = None
+            return None
+        image = QImage()
+        if not image.loadFromData(frame_bytes):
+            self.preview_cache[event.event_id] = None
+            return None
+        self.preview_cache[event.event_id] = image
+        return image
+
+    def _refresh_preview(self) -> None:
+        event_id = self._selected_event_id()
+        event = self.event_map.get(event_id or "")
+        result = self.result_map.get(event_id or "")
+        if event is None:
+            self.preview_title.setText("选择一条记录查看画面和输出内容")
+            self.preview_frame.setText("当前记录缺少字幕事件")
+            self.preview_frame.set_frame(None)
+            self.preview_details.setPlainText("")
+            return
+
+        self.preview_title.setText(f"{event.event_id} / {self._event_time(event)} / {self._status_text(event.event_id)}")
+        self.preview_frame.set_region(self.subtitle_region_rect)
+        image = self._preview_image_for_event(event)
+        if image is None:
+            self.preview_frame.setText("未能读取视频帧，请检查视频路径或 ffmpeg")
+            self.preview_frame.set_frame(None)
+        else:
+            self.preview_frame.set_frame(image)
+
+        text = event.text
+        if text.startswith(REVIEW_TEXT_OVERRIDE):
+            text = text[len(REVIEW_TEXT_OVERRIDE):]
+        details = [
+            f"当前样式：{event.style}",
+            f"原始样式：{event.original_style}",
+            f"字幕文本：{text}",
+        ]
+        if result and result.text_result and result.text_result.review_reasons:
+            details.append("文字核查：" + "；".join(result.text_result.review_reasons))
+        if result and result.error_messages:
+            details.append("错误：" + " | ".join(result.error_messages))
+        self.preview_details.setPlainText("\n".join(details))
+
+    def _style_choices(self, current_style: str) -> list[str]:
+        choices = []
+        for profile in self.style_profiles:
+            if profile.ass_style_name and profile.ass_style_name not in choices:
+                choices.append(profile.ass_style_name)
+        if current_style and current_style not in choices:
+            choices.insert(0, current_style)
+        return choices or ([current_style] if current_style else ["Default"])
+
+    def _populate_table(self) -> None:
+        self.table.setRowCount(0)
+        self.row_event_ids = []
+        self.style_combos = {}
+        ordered_ids = [event.event_id for event in self.events] or [result.event_id for result in self.results]
+        for event_id in ordered_ids:
+            if not self._include_event(event_id):
+                continue
+            event = self.event_map.get(event_id)
+            result = self.result_map.get(event_id)
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.row_event_ids.append(event_id)
+            current_style = event.style if event is not None else ""
+            text = event.text if event is not None else ""
+            if text.startswith(REVIEW_TEXT_OVERRIDE):
+                text = text[len(REVIEW_TEXT_OVERRIDE):]
+            self._set_item(row, 0, event_id)
+            self._set_item(row, 1, self._event_time(event))
+            self._set_item(row, 2, self._status_text(event_id))
+            self._set_item(row, 3, current_style)
+            combo = QComboBox()
+            combo.addItems(self._style_choices(current_style))
+            combo.setCurrentText(current_style)
+            combo.setEnabled(self._needs_review(event_id))
+            self.style_combos[event_id] = combo
+            self.table.setCellWidget(row, 4, combo)
+            self._set_item(row, 5, text)
+            self._set_item(row, 6, " | ".join(result.error_messages) if result else "")
+        if self.table.rowCount() > 0:
+            self.table.selectRow(0)
+        else:
+            self._refresh_preview()
+
+    def _apply_style_fixes(self) -> None:
+        if self.document is None:
+            QMessageBox.warning(self, WINDOW_TITLE, "未找到可写回的输出 ASS。")
+            return
+        changed = 0
+        for event_id, combo in self.style_combos.items():
+            if not self._needs_review(event_id):
+                continue
+            event = self.event_map.get(event_id)
+            if event is None:
+                continue
+            selected_style = combo.currentText().strip()
+            if selected_style:
+                event.style = selected_style
+            event.clear_review_text_marker()
+            self.applied_style_event_ids.add(event_id)
+            changed += 1
+        if changed == 0:
+            QMessageBox.information(self, WINDOW_TITLE, "当前筛选结果中没有可应用的样式核查项。")
+            return
+        AssWriter().write(self.document, self.output_path)
+        self._populate_table()
+        QMessageBox.information(self, WINDOW_TITLE, f"已写回 {changed} 条样式修正。")
+
+    def _text_failed_ids_from_selection(self) -> list[str]:
+        rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        event_ids = [self.row_event_ids[row] for row in rows if row < len(self.row_event_ids)]
+        return [event_id for event_id in event_ids if self._is_text_failed(event_id)]
+
+    def _retry_selected_text_failures(self) -> None:
+        event_ids = self._text_failed_ids_from_selection()
+        if not event_ids:
+            QMessageBox.warning(self, WINDOW_TITLE, "请先选择至少一条文字失败事件。")
+            return
+        self.retry_failed_tasks_map = {event_id: ["text"] for event_id in event_ids}
+        self.accept()
+
+    def _retry_all_text_failures(self) -> None:
+        event_ids = [result.event_id for result in self.results if "text" in result.failed_tasks]
+        if not event_ids:
+            QMessageBox.information(self, WINDOW_TITLE, "没有文字失败事件需要复跑。")
+            return
+        self.retry_failed_tasks_map = {event_id: ["text"] for event_id in event_ids}
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -284,6 +656,10 @@ class MainWindow(QMainWindow):
         self.current_event_index = -1
         self.pending_retry_event_ids: set[str] | None = None
         self.pending_retry_failed_tasks: dict[str, list[str]] | None = None
+        self.imported_ass_style_path = ""
+        self.imported_ass_style_section: list[str] = []
+        self.last_run_results: list[EventJobResult] = []
+        self.last_run_style_profiles: list[StyleProfile] = []
         self.api_settings_dialog = ApiSettingsDialog(self)
         self.style_job_widget = self.api_settings_dialog.style_job_widget
         self.text_job_widget = self.api_settings_dialog.text_job_widget
@@ -411,6 +787,10 @@ class MainWindow(QMainWindow):
         self.include_samples_check = QCheckBox("运行时使用已保存的样本图作为视觉参考（few-shot）")
         self.include_samples_check.setToolTip("勾选后，已锁定样式的样本图会作为视觉示例发送给 LLM，提高识别准确率，但会增加 token 消耗")
         styles_layout.addWidget(self.include_samples_check)
+        self.override_output_styles_check = QCheckBox("输出时用导入 ASS 样式覆盖样式段")
+        self.override_output_styles_check.setEnabled(False)
+        self.override_output_styles_check.setToolTip("从 ASS 导入样式后可用；运行前会确认是否用导入文件的 [V4+ Styles] 覆盖输出 ASS 的样式段")
+        styles_layout.addWidget(self.override_output_styles_check)
         parent_layout.addWidget(styles_box, 1)
 
     def _setup_preview_group(self, parent_layout: QVBoxLayout) -> None:
@@ -469,7 +849,7 @@ class MainWindow(QMainWindow):
         actions_layout = QHBoxLayout()
         self.refresh_preview_button = QPushButton("刷新预览")
         self.refresh_preview_button.clicked.connect(self._refresh_video_preview)
-        self.run_button = QPushButton("运行当前勾选的工作")
+        self.run_button = QPushButton("开始处理")
         self.run_button.clicked.connect(self._start_run)
         self.save_button = QPushButton("保存设置")
         self.save_button.clicked.connect(self._save_settings)
@@ -489,7 +869,11 @@ class MainWindow(QMainWindow):
         self.retry_failed_button = QPushButton("复跑失败项")
         self.retry_failed_button.setEnabled(False)
         self.retry_failed_button.clicked.connect(self._retry_failed_events)
+        self.review_results_button = QPushButton("审查结果")
+        self.review_results_button.setEnabled(False)
+        self.review_results_button.clicked.connect(self._open_result_review)
         progress_actions.addStretch(1)
+        progress_actions.addWidget(self.review_results_button)
         progress_actions.addWidget(self.retry_failed_button)
         progress_layout.addWidget(self.run_progress_label)
         progress_layout.addWidget(self.run_progress_bar)
@@ -500,13 +884,19 @@ class MainWindow(QMainWindow):
     # Menu & dialogs
     # ------------------------------------------------------------------
 
+    def _enforce_text_ocr_budget(self, widget: ProviderJobWidget) -> None:
+        widget.max_tokens_spin.setValue(max(widget.max_tokens_spin.value(), 512))
+        widget.max_edge_spin.setValue(max(widget.max_edge_spin.value(), 1280))
+
     def _open_api_settings(self) -> None:
         self.api_settings_dialog.load_settings(self.style_job_widget.dump_settings(), self.text_job_widget.dump_settings())
+        self._enforce_text_ocr_budget(self.api_settings_dialog.text_job_widget)
         self.api_settings_dialog.load_history(self._style_job_history, self._text_job_history)
         if self.api_settings_dialog.exec() == QDialog.Accepted:
             style_job, text_job = self.api_settings_dialog.dump_settings()
             self.style_job_widget.load_settings(style_job)
             self.text_job_widget.load_settings(text_job)
+            self._enforce_text_ocr_budget(self.text_job_widget)
             self._style_job_history, self._text_job_history = self.api_settings_dialog.dump_history()
             self._save_settings()
             self._run_startup_checks()
@@ -900,6 +1290,7 @@ class MainWindow(QMainWindow):
                 raise ValueError("样式模板 JSON 顶层必须是数组")
             self._load_style_rows(data)
             self._renumber_style_rows()
+            self._set_imported_ass_style_section("", [], enabled=False)
             self._append_log(f"已导入样式模板：{path}")
         except Exception as exc:
             QMessageBox.critical(self, WINDOW_TITLE, str(exc))
@@ -913,11 +1304,26 @@ class MainWindow(QMainWindow):
             if not styles:
                 QMessageBox.warning(self, WINDOW_TITLE, "该 ASS 文件中未找到 [V4+ Styles] 样式定义。")
                 return
+            style_section = extract_ass_style_section(path)
             self._load_style_rows(styles)
             self._renumber_style_rows()
-            self._append_log(f"已从 ASS 导入 {len(styles)} 个样式：{path}")
+            self._set_imported_ass_style_section(path, style_section, enabled=True)
+            self._append_log(f"已从 ASS 导入 {len(styles)} 个样式，并启用输出样式段覆盖：{path}")
         except Exception as exc:
             QMessageBox.critical(self, WINDOW_TITLE, f"导入 ASS 样式失败：{exc}")
+
+    def _set_imported_ass_style_section(self, path: str, style_section: list[str], *, enabled: bool) -> None:
+        self.imported_ass_style_path = path
+        self.imported_ass_style_section = list(style_section)
+        has_section = bool(style_section)
+        self.override_output_styles_check.setEnabled(has_section)
+        self.override_output_styles_check.setChecked(enabled and has_section)
+        if has_section:
+            source_name = Path(path).name if path else "已保存样式段"
+            style_count = sum(1 for line in style_section if line.strip().startswith("Style:"))
+            self.override_output_styles_check.setText(f"输出时用导入 ASS 样式覆盖样式段（{source_name}，{style_count} 个样式）")
+        else:
+            self.override_output_styles_check.setText("输出时用导入 ASS 样式覆盖样式段")
 
     def _export_style_template(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "导出样式模板", "styles.json", "JSON files (*.json)")
@@ -1123,6 +1529,49 @@ class MainWindow(QMainWindow):
             else:
                 self._append_log(f"[WARN] {issue}")
 
+    def _selected_output_style_section(self) -> list[str] | None:
+        if not self.override_output_styles_check.isChecked() or not self.imported_ass_style_section:
+            return None
+        return list(self.imported_ass_style_section)
+
+    def _style_section_source_label(self) -> str:
+        if not self.imported_ass_style_section:
+            return ""
+        style_count = sum(1 for line in self.imported_ass_style_section if line.strip().startswith("Style:"))
+        source = self.imported_ass_style_path or "已保存的导入样式段"
+        return f"{source}（{style_count} 个样式）"
+
+    def _payload_event_count(self, payload: RunPayload) -> int:
+        if payload.event_ids is not None:
+            return len(payload.event_ids)
+        if self.loaded_events:
+            return len(self.loaded_events)
+        try:
+            return len(parse_subtitle_document(payload.ass_input_path).events)
+        except Exception:
+            return 0
+
+    def _confirm_run_payload(self, payload: RunPayload) -> bool:
+        retry_count = len(payload.event_ids) if payload.event_ids else 0
+        dialog = RunSummaryDialog(
+            self,
+            payload,
+            event_count=self._payload_event_count(payload),
+            retry_count=retry_count,
+            output_exists=Path(payload.ass_output_path).exists(),
+            style_section_source=self._style_section_source_label(),
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return False
+        if dialog.use_output_style_override and self.imported_ass_style_section:
+            payload.output_style_section_lines = list(self.imported_ass_style_section)
+            self._append_log(f"本次运行将覆盖输出 ASS 样式段：{self._style_section_source_label()}")
+        else:
+            payload.output_style_section_lines = None
+            if self.imported_ass_style_section:
+                self._append_log("本次运行不覆盖输出 ASS 样式段。")
+        return True
+
     def _build_payload(self) -> RunPayload:
         video_path = self.video_edit.text().strip()
         ass_input_path = self.ass_input_edit.text().strip()
@@ -1142,12 +1591,18 @@ class MainWindow(QMainWindow):
 
         style_provider = self.style_job_widget.build_provider_config()
         text_provider = self.text_job_widget.build_provider_config()
+        if text_provider is not None and text_provider.max_output_tokens < 512:
+            text_provider.max_output_tokens = 512
         if style_provider is None and text_provider is None:
             raise ValueError("样式识别和文字提取至少要启用一个任务")
 
         style_profiles = self._parse_style_profiles()
         if style_provider is not None and not style_profiles:
             raise ValueError("启用样式识别时，至少要提供一个锁定样式")
+
+        text_image_options = self.text_job_widget.build_image_options()
+        if text_image_options.max_edge < 1280:
+            text_image_options.max_edge = 1280
 
         return RunPayload(
             video_path=video_path,
@@ -1162,10 +1617,11 @@ class MainWindow(QMainWindow):
             frame_concurrency=self.frame_concurrency_spin.value(),
             subtitle_language=self.subtitle_language_combo.currentData() or "auto",
             style_image_options=self.style_job_widget.build_image_options(),
-            text_image_options=self.text_job_widget.build_image_options(),
+            text_image_options=text_image_options,
             event_ids=self.pending_retry_event_ids,
             include_samples=self.include_samples_check.isChecked(),
             failed_tasks_map=self.pending_retry_failed_tasks,
+            output_style_section_lines=self._selected_output_style_section(),
         )
 
     def _start_run(self) -> None:
@@ -1175,6 +1631,10 @@ class MainWindow(QMainWindow):
             payload = self._build_payload()
         except Exception as exc:
             QMessageBox.critical(self, WINDOW_TITLE, str(exc))
+            return
+        if not self._confirm_run_payload(payload):
+            self.pending_retry_event_ids = None
+            self.pending_retry_failed_tasks = None
             return
         self._save_settings()
         retry_count = len(self.pending_retry_event_ids) if self.pending_retry_event_ids else 0
@@ -1213,8 +1673,13 @@ class MainWindow(QMainWindow):
     def _on_run_finished(self, results: list[EventJobResult]) -> None:
         self.run_progress_bar.setValue(100)
         self.run_progress_label.setText("处理完成")
+        payload = self.worker.payload if self.worker is not None else None
+        self.last_run_results = results
+        self.last_run_style_profiles = list(payload.style_profiles) if payload is not None else self._parse_style_profiles()
+        self.review_results_button.setEnabled(bool(results) and bool(self.ass_output_edit.text().strip()))
         style_hits = sum(1 for item in results if item.style_result and item.style_result.matched)
         review_hits = sum(1 for item in results if item.style_result and item.style_result.review_required)
+        text_review_hits = sum(1 for item in results if item.text_result and item.text_result.review_required)
         text_hits = sum(1 for item in results if item.text_result and item.text_result.matched)
         no_subtitle = sum(1 for item in results if item.text_result and not item.text_result.matched)
         failed_events = [item for item in results if item.error_messages]
@@ -1227,16 +1692,24 @@ class MainWindow(QMainWindow):
             self._append_log(f"任务状态已保存：{job_path}")
         if review_hits:
             self._append_log(f"其中 {review_hits} 条样式已标记为“需核查”。")
+        if text_review_hits:
+            self._append_log(f"其中 {text_review_hits} 条文字识别结果较长或疑似不完整，已进入“文字需核查”。")
         if no_subtitle:
             self._append_log(f"其中 {no_subtitle} 条文字识别结果为未识别到字幕。")
         if failed_events:
             self.retry_failed_button.setEnabled(True)
             self._append_log(f"其中 {len(failed_events)} 条字幕处理失败，已跳过并继续后续任务。")
+            report_path = self._write_failed_events_report(failed_events)
+            if report_path:
+                self._append_log(f"失败事件清单已导出：{report_path}")
             for item in failed_events[:5]:
                 self._append_log(f"失败 {item.event_id}: {' | '.join(item.error_messages)}")
         else:
             self.retry_failed_button.setEnabled(False)
-        QMessageBox.information(self, WINDOW_TITLE, "处理完成")
+        if review_hits or text_review_hits or any("text" in item.failed_tasks for item in results):
+            QMessageBox.information(self, WINDOW_TITLE, "处理完成。可点击“审查结果”处理需核查样式或复跑文字失败。")
+        else:
+            QMessageBox.information(self, WINDOW_TITLE, "处理完成")
 
     def _on_run_failed(self, message: str) -> None:
         self.run_progress_label.setText("处理失败")
@@ -1249,7 +1722,7 @@ class MainWindow(QMainWindow):
         payload = self.worker.payload
         if not payload.ass_output_path:
             return None
-        event_lookup = {event.event_id: event for event in self.loaded_events}
+        event_lookup = self._job_event_lookup(payload.ass_output_path)
         record = self.job_store.save_run(
             video_path=payload.video_path,
             subtitle_input_path=payload.ass_input_path,
@@ -1259,6 +1732,81 @@ class MainWindow(QMainWindow):
             previous_record=self.job_store.load_latest_for_output(payload.ass_output_path),
         )
         return str(self.job_store.path_for(record["job_id"]))
+
+    def _job_event_lookup(self, output_path: str) -> dict[str, SubtitleEvent]:
+        try:
+            if output_path and Path(output_path).exists():
+                document = parse_subtitle_document(output_path)
+                return {event.event_id: event for event in document.events}
+        except Exception as exc:
+            self._append_log(f"读取输出字幕用于任务记录失败，改用输入字幕事件：{exc}")
+        return {event.event_id: event for event in self.loaded_events}
+
+    def _open_result_review(self) -> None:
+        output_path = self.ass_output_edit.text().strip()
+        if not output_path or not Path(output_path).exists():
+            QMessageBox.warning(self, WINDOW_TITLE, "请先完成一次运行并生成输出 ASS。")
+            return
+        results = self.last_run_results or self._results_from_latest_job_record()
+        if not results:
+            QMessageBox.warning(self, WINDOW_TITLE, "当前没有可审查的运行结果。")
+            return
+        style_profiles = self.last_run_style_profiles or self._parse_style_profiles()
+        review_video_path = self.video_edit.text().strip()
+        if not review_video_path:
+            review_video_path = str(self._latest_job_record().get("video_path", "")).strip()
+        dialog = ResultReviewDialog(
+            self,
+            output_path,
+            results,
+            style_profiles,
+            video_path=review_video_path,
+            subtitle_region_rect=self._subtitle_region_rect(),
+        )
+        dialog.exec()
+        if dialog.retry_failed_tasks_map:
+            self._start_retry_from_map(dialog.retry_failed_tasks_map)
+
+    def _results_from_latest_job_record(self) -> list[EventJobResult]:
+        record = self._latest_job_record()
+        results: list[EventJobResult] = []
+        for item in record.get("events", []):
+            event_id = str(item.get("event_id", "")).strip()
+            if not event_id:
+                continue
+            text_task = (item.get("tasks") or {}).get("text") or {}
+            text_result = None
+            if text_task.get("review_required") or text_task.get("parsed_text") or text_task.get("raw_response"):
+                text_result = TextJobResult(
+                    matched=text_task.get("status") == "success",
+                    text=str(text_task.get("parsed_text", "")),
+                    raw_response=str(text_task.get("raw_response", "")),
+                    review_required=bool(text_task.get("review_required", False)),
+                    review_reasons=[str(reason) for reason in text_task.get("review_reasons", [])],
+                )
+            results.append(
+                EventJobResult(
+                    event_id=event_id,
+                    text_result=text_result,
+                    error_messages=[str(message) for message in item.get("error_messages", [])],
+                    failed_tasks=[str(task) for task in item.get("failed_tasks", [])],
+                    final_action=str(item.get("final_action", "skip")),
+                )
+            )
+        return results
+
+    def _start_retry_from_map(self, failed_tasks_map: dict[str, list[str]]) -> None:
+        if self.worker is not None:
+            QMessageBox.warning(self, WINDOW_TITLE, "当前仍有任务运行中，无法启动复跑。")
+            return
+        event_ids = set(failed_tasks_map.keys())
+        if not event_ids:
+            QMessageBox.warning(self, WINDOW_TITLE, "没有可复跑的失败项。")
+            return
+        self.pending_retry_event_ids = event_ids
+        self.pending_retry_failed_tasks = failed_tasks_map
+        self._append_log(f"准备复跑失败项：{len(event_ids)} 条")
+        self._start_run()
 
     def _latest_job_record(self) -> dict:
         output_path = self.ass_output_edit.text().strip()
@@ -1333,10 +1881,7 @@ class MainWindow(QMainWindow):
         if not event_ids:
             QMessageBox.warning(self, WINDOW_TITLE, "未找到失败事件清单，请先完成一次包含失败项的运行。")
             return
-        self.pending_retry_event_ids = event_ids
-        self.pending_retry_failed_tasks = failed_tasks_map
-        self._append_log(f"准备复跑失败项：{len(event_ids)} 条")
-        self._start_run()
+        self._start_retry_from_map(failed_tasks_map)
 
     # ------------------------------------------------------------------
     # Usage & logging
@@ -1402,14 +1947,23 @@ class MainWindow(QMainWindow):
                 self._load_legacy_style_text(legacy_text)
         self.style_job_widget.load_settings(data.get("style_job", {}))
         self.text_job_widget.load_settings(data.get("text_job", {}))
+        self._enforce_text_ocr_budget(self.text_job_widget)
         self._style_job_history = data.get("style_job_history", [])
         self._text_job_history = data.get("text_job_history", [])
         self.include_samples_check.setChecked(data.get("include_samples", False))
+        imported_style_section = data.get("imported_ass_style_section") or []
+        self._set_imported_ass_style_section(
+            data.get("imported_ass_style_path", ""),
+            imported_style_section if isinstance(imported_style_section, list) else [],
+            enabled=bool(data.get("override_output_styles", False)),
+        )
         if self.ass_input_edit.text().strip():
             try:
                 self._load_subtitle_events()
             except Exception as exc:
                 self._append_log(f"字幕事件加载失败：{exc}")
+        output_path = self.ass_output_edit.text().strip()
+        self.review_results_button.setEnabled(bool(output_path and Path(output_path).exists() and self._latest_job_record()))
         QTimer.singleShot(0, self._refresh_video_preview)
 
     def _save_settings(self) -> None:
@@ -1427,6 +1981,9 @@ class MainWindow(QMainWindow):
                     "style_compact_text": self.style_compact_edit.text().strip(),
                     "style_profiles": self._dump_style_rows(),
                     "include_samples": self.include_samples_check.isChecked(),
+                    "imported_ass_style_path": self.imported_ass_style_path,
+                    "imported_ass_style_section": self.imported_ass_style_section,
+                    "override_output_styles": self.override_output_styles_check.isChecked(),
                     "style_job": self.style_job_widget.dump_settings(),
                     "text_job": self.text_job_widget.dump_settings(),
                     "style_job_history": self._style_job_history,

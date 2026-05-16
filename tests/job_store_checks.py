@@ -14,12 +14,13 @@ class JobStoreTests(unittest.TestCase):
                 EventJobResult(
                     event_id="event-1",
                     style_result=StyleJobResult(matched=True, style_id=1),
-                    text_result=TextJobResult(matched=True, text="hello"),
+                    text_result=TextJobResult(matched=True, text="hello", review_required=True, review_reasons=["long text"]),
                     final_action="apply_style",
                 ),
                 EventJobResult(
                     event_id="event-2",
                     style_result=StyleJobResult(matched=True, style_id=2),
+                    text_result=TextJobResult(matched=False, raw_response='{"m":1,"t" "bad"}'),
                     final_action="failed",
                     error_messages=["text_job: bad json"],
                     failed_tasks=["text"],
@@ -39,8 +40,11 @@ class JobStoreTests(unittest.TestCase):
         self.assertEqual(loaded["summary"]["failed_events"], 1)
         self.assertEqual(loaded["events"][0]["tasks"]["style"]["status"], "success")
         self.assertEqual(loaded["events"][0]["tasks"]["text"]["status"], "success")
+        self.assertTrue(loaded["events"][0]["tasks"]["text"]["review_required"])
+        self.assertEqual(loaded["events"][0]["tasks"]["text"]["review_reasons"], ["long text"])
         self.assertEqual(loaded["events"][1]["tasks"]["style"]["status"], "success")
         self.assertEqual(loaded["events"][1]["tasks"]["text"]["status"], "failed")
+        self.assertEqual(loaded["events"][1]["tasks"]["text"]["raw_response"], '{"m":1,"t" "bad"}')
 
     def test_latest_failed_tasks_map_uses_output_index(self) -> None:
         with TemporaryDirectory() as temp_dir:

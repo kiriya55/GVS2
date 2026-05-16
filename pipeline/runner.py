@@ -34,6 +34,7 @@ def run_gvs2(
     event_ids: set[str] | None = None,
     include_samples: bool = False,
     failed_tasks_map: dict[str, list[str]] | None = None,
+    output_style_section_lines: list[str] | None = None,
 ) -> list[EventJobResult]:
     logger.info(f"run_gvs2: 开始处理，视频={video_path}, 输入={ass_input_path}, 输出={ass_output_path}")
     logger.info(f"run_gvs2: 样式配置数={len(style_profiles)}, style_provider={'有' if style_provider else '无'}, text_provider={'有' if text_provider else '无'}")
@@ -98,6 +99,6 @@ def run_gvs2(
     results = pipeline.run(video_path, document, style_profiles, progress_callback=progress_callback, failed_tasks_map=failed_tasks_map)
     logger.info(f"run_gvs2: Pipeline处理完成，返回结果数={len(results)}")
     
-    AssWriter().write(document, ass_output_path)
+    AssWriter().write(document, ass_output_path, style_section_lines=output_style_section_lines)
     logger.info(f"run_gvs2: 写入输出完成，{ass_output_path}")
     return results

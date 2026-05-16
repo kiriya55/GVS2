@@ -57,12 +57,23 @@ class JobStore:
         return str(Path(ass_output_path).expanduser().resolve(strict=False))
 
     def _task_status(self, item: EventJobResult, task: str) -> dict[str, Any]:
-        if task in item.failed_tasks:
-            return {"status": "failed"}
         result = item.style_result if task == "style" else item.text_result
+        if task in item.failed_tasks:
+            status = {"status": "failed"}
+            if result is not None and result.raw_response:
+                status["raw_response"] = result.raw_response
+            return status
         if result is None:
             return {"status": "skipped"}
-        return {"status": "success" if result.matched else "no_match"}
+        status = {"status": "success" if result.matched else "no_match"}
+        if result.raw_response:
+            status["raw_response"] = result.raw_response
+        if task == "text" and getattr(result, "text", ""):
+            status["parsed_text"] = result.text
+        if task == "text" and getattr(result, "review_required", False):
+            status["review_required"] = True
+            status["review_reasons"] = list(getattr(result, "review_reasons", []))
+        return status
 
     def save_run(
         self,

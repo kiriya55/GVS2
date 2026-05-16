@@ -9,7 +9,7 @@ from models.subtitle_event import SubtitleEvent
 from models.style_profile import StyleProfile
 from pipeline.event_pipeline import EventPipeline, PipelineSettings
 from pipeline.runner import run_gvs2
-from providers.base import ProviderConfig
+from providers.base import ProviderConfig, ProviderUsage
 from providers.response_parser import parse_text_result
 from services.subtitle_parser import AssDocument, GeneratedAssDocument
 
@@ -110,7 +110,7 @@ class RetryRunnerTests(unittest.TestCase):
                 return []
 
         class FakeWriter:
-            def write(self, ass_document, _output_path):
+            def write(self, ass_document, _output_path, style_section_lines=None):
                 written_counts.append(len(ass_document.events))
                 return _output_path
 
@@ -154,7 +154,7 @@ class RetryRunnerTests(unittest.TestCase):
                 return []
 
         class FakeWriter:
-            def write(self, ass_document, _output_path):
+            def write(self, ass_document, _output_path, style_section_lines=None):
                 written_styles.append([event.style for event in ass_document.events])
                 return _output_path
 
@@ -203,7 +203,7 @@ class RetryRunnerTests(unittest.TestCase):
                 return []
 
         class FakeWriter:
-            def write(self, ass_document, _output_path):
+            def write(self, ass_document, _output_path, style_section_lines=None):
                 return _output_path
 
         with TemporaryDirectory() as temp_dir:
@@ -231,6 +231,41 @@ class RetryRunnerTests(unittest.TestCase):
 
         self.assertEqual(processed_texts, [["processed 0", "processed 1", "processed 2"]])
 
+    def test_runner_passes_output_style_section_to_writer(self) -> None:
+        document = AssDocument(lines=[], event_indices=[], events=[make_event("event-1", 0)])
+        captured_style_sections: list[list[str] | None] = []
+
+        class FakePipeline:
+            def __init__(self, _settings) -> None:
+                pass
+
+            def run(self, _video_path, ass_document, _style_profiles, progress_callback=None, failed_tasks_map=None):
+                return []
+
+        class FakeWriter:
+            def write(self, ass_document, _output_path, style_section_lines=None):
+                captured_style_sections.append(style_section_lines)
+                return _output_path
+
+        style_section = ["[V4+ Styles]\n", "Format: Name, Fontname\n", "Style: Imported,Arial\n"]
+
+        with (
+            patch("pipeline.runner.parse_subtitle_document", return_value=document),
+            patch("pipeline.runner.EventPipeline", FakePipeline),
+            patch("pipeline.runner.AssWriter", FakeWriter),
+        ):
+            run_gvs2(
+                video_path="video.mp4",
+                ass_input_path="input.ass",
+                ass_output_path="output.ass",
+                style_profiles=[],
+                style_provider=None,
+                text_provider=ProviderConfig(provider_type="openai", model="test", api_key="key"),
+                output_style_section_lines=style_section,
+            )
+
+        self.assertEqual(captured_style_sections, [style_section])
+
 
 class ResponseParserTests(unittest.TestCase):
     def test_text_result_accepts_literal_newline_inside_json_string(self) -> None:
@@ -238,6 +273,30 @@ class ResponseParserTests(unittest.TestCase):
 
         self.assertTrue(result.matched)
         self.assertEqual(result.text, "first\\Nsecond")
+
+    def test_text_result_recovers_truncated_closing_json_for_text(self) -> None:
+        result = parse_text_result('{"m":1,"t":"この地下街 どうなってんの!?')
+
+        self.assertTrue(result.matched)
+        self.assertEqual(result.text, "この地下街 どうなってんの!?")
+
+    def test_text_result_recovers_missing_text_colon(self) -> None:
+        result = parse_text_result('{"m":1,"t" "なんやその情けないうめき声"}')
+
+        self.assertTrue(result.matched)
+        self.assertEqual(result.text, "なんやその情けないうめき声")
+
+    def test_text_result_recovers_fullwidth_text_colon(self) -> None:
+        result = parse_text_result('{"m":1,"t"："なんやその情けないうめき声"}')
+
+        self.assertTrue(result.matched)
+        self.assertEqual(result.text, "なんやその情けないうめき声")
+
+    def test_text_result_marks_recovered_json_for_review(self) -> None:
+        result = parse_text_result('{"m":1,"t":"この地下街 どうなってんの!?')
+
+        self.assertTrue(result.review_required)
+        self.assertIn("JSON", result.review_reasons[0])
 
 
 class StyleFallbackTests(unittest.TestCase):
@@ -268,7 +327,38 @@ class StyleFallbackTests(unittest.TestCase):
         self.assertTrue(event.text.startswith(r"{\i1\c&H00FFFF&"))
         event.set_text("recognized text")
         self.assertEqual(event.text, r"{\i1\c&H00FFFF&\3c&H000000&}recognized text")
+        event.clear_review_text_marker()
+        self.assertEqual(event.text, "recognized text")
         self.assertEqual(result.final_action, "review_style")
+
+
+class TextReviewTests(unittest.TestCase):
+    def test_long_text_result_is_marked_for_review(self) -> None:
+        pipeline = EventPipeline.__new__(EventPipeline)
+        pipeline.settings = PipelineSettings()
+        pipeline.text_provider = SimpleNamespace(config=ProviderConfig(provider_type="openai", model="test", api_key="key", max_output_tokens=512))
+        long_text = "あ" * 80
+        pipeline.text_provider.classify = lambda _prompt, _images: SimpleNamespace(text='{"m":1,"t":"' + long_text + '"}', usage=ProviderUsage(output_tokens=20))
+        pipeline._build_images = lambda _video_path, _event, _options, _raw_frames=None: [("image/jpeg", "data")]
+        event = make_event("event-1", 0)
+
+        result = pipeline._process_text_event("video.mp4", event)
+
+        self.assertTrue(result.text_result.review_required)
+        self.assertIn("较长", result.text_result.review_reasons[0])
+
+    def test_output_near_token_limit_is_marked_for_review(self) -> None:
+        pipeline = EventPipeline.__new__(EventPipeline)
+        pipeline.settings = PipelineSettings()
+        pipeline.text_provider = SimpleNamespace(config=ProviderConfig(provider_type="openai", model="test", api_key="key", max_output_tokens=100))
+        pipeline.text_provider.classify = lambda _prompt, _images: SimpleNamespace(text='{"m":1,"t":"short"}', usage=ProviderUsage(output_tokens=95))
+        pipeline._build_images = lambda _video_path, _event, _options, _raw_frames=None: [("image/jpeg", "data")]
+        event = make_event("event-1", 0)
+
+        result = pipeline._process_text_event("video.mp4", event)
+
+        self.assertTrue(result.text_result.review_required)
+        self.assertTrue(any("token" in reason for reason in result.text_result.review_reasons))
 
 
 if __name__ == "__main__":

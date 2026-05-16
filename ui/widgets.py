@@ -93,6 +93,7 @@ class RunPayload:
     event_ids: set[str] | None = None
     include_samples: bool = False
     failed_tasks_map: dict[str, list[str]] | None = None
+    output_style_section_lines: list[str] | None = None
 
 
 class PipelineWorker(QThread):
@@ -126,6 +127,7 @@ class PipelineWorker(QThread):
                 event_ids=self.payload.event_ids,
                 include_samples=self.payload.include_samples,
                 failed_tasks_map=self.payload.failed_tasks_map,
+                output_style_section_lines=self.payload.output_style_section_lines,
             )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -168,6 +170,9 @@ class ProviderJobWidget(QGroupBox):
         self.save_history_button = QPushButton("保存当前")
         self.save_history_button.setToolTip("将当前 Provider 配置保存到历史记录")
         self.save_history_button.clicked.connect(self._save_current_to_history)
+        self.test_connection_button = QPushButton("测试连接")
+        self.test_connection_button.setToolTip("使用当前 Provider 配置发送一次小请求，确认 API 可用")
+        self.test_connection_button.clicked.connect(self._test_connection)
         self.delete_history_button = QPushButton("删除")
         self.delete_history_button.setToolTip("删除选中的历史记录")
         self.delete_history_button.clicked.connect(self._delete_selected_history)
@@ -208,6 +213,7 @@ class ProviderJobWidget(QGroupBox):
         history_row.addWidget(QLabel("历史"))
         history_row.addWidget(self.history_combo, 1)
         history_row.addWidget(self.save_history_button)
+        history_row.addWidget(self.test_connection_button)
         history_row.addWidget(self.delete_history_button)
         layout.addLayout(history_row)
 
@@ -256,6 +262,7 @@ class ProviderJobWidget(QGroupBox):
             self.base_url_edit,
             self.api_key_edit,
             self.max_tokens_spin,
+            self.test_connection_button,
             self.advanced_toggle,
             self.advanced_widget,
         ]:
@@ -334,6 +341,19 @@ class ProviderJobWidget(QGroupBox):
             return
         self._history.pop(index)
         self._refresh_history_combo()
+
+    def _test_connection(self) -> None:
+        try:
+            config = self.build_provider_config()
+            if config is None:
+                QMessageBox.warning(self, self.title(), "请先启用任务并填写 Provider 配置。")
+                return
+            provider = build_provider(config)
+            result = provider.classify("Return exactly OK. No markdown.", [])
+            text = result.text.strip() or "无返回内容"
+            QMessageBox.information(self, self.title(), f"连接测试成功：{text[:120]}")
+        except Exception as exc:
+            QMessageBox.critical(self, self.title(), f"连接测试失败：{exc}")
 
     def load_history(self, history: list[dict]) -> None:
         self._history = list(history)
@@ -424,7 +444,7 @@ class ApiSettingsDialog(QDialog):
 
         jobs_layout = QHBoxLayout()
         self.style_job_widget = ProviderJobWidget("样式识别任务", enabled=True, default_model="claude-opus-4-7", default_max_edge=640, default_max_output_tokens=32)
-        self.text_job_widget = ProviderJobWidget("文字提取任务", enabled=False, default_model="claude-opus-4-7", default_max_edge=768, default_max_output_tokens=256)
+        self.text_job_widget = ProviderJobWidget("文字提取任务", enabled=False, default_model="claude-opus-4-7", default_max_edge=1280, default_max_output_tokens=512)
         jobs_layout.addWidget(self.style_job_widget)
         jobs_layout.addWidget(self.text_job_widget)
         layout.addLayout(jobs_layout)

@@ -21,6 +21,8 @@ class TextJobResult:
     matched: bool
     text: str = ""
     raw_response: str = ""
+    review_required: bool = False
+    review_reasons: list[str] = field(default_factory=list)
     usage: ProviderUsage = field(default_factory=ProviderUsage)
 
 

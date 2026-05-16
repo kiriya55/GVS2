@@ -8,7 +8,7 @@ from typing import Optional
 
 import requests
 
-from models.job_result import EventJobResult
+from models.job_result import EventJobResult, TextJobResult
 from models.style_profile import StyleProfile, load_sample_images
 from providers.base import ProviderConfig
 from providers.factory import build_provider
@@ -63,6 +63,19 @@ class EventPipeline:
             logger.info(f"样式识别Provider: {self.style_provider.config.provider_type} / {self.style_provider.config.model}")
         if self.text_provider:
             logger.info(f"文字提取Provider: {self.text_provider.config.provider_type} / {self.text_provider.config.model}")
+
+    def _text_review_reasons(self, result: TextJobResult, response) -> list[str]:
+        reasons = list(result.review_reasons)
+        visible_text = result.text.replace("\\N", "")
+        if len(visible_text) >= 80:
+            reasons.append("识别文本较长，请确认长字幕是否完整")
+        if result.text.count("\\N") >= 2:
+            reasons.append("识别结果超过两行，请确认是否包含多余文字")
+        max_tokens = self.text_provider.config.max_output_tokens if self.text_provider is not None else 0
+        output_tokens = getattr(response.usage, "output_tokens", 0) if response is not None else 0
+        if max_tokens and output_tokens and output_tokens >= max_tokens * 0.9:
+            reasons.append("模型输出接近最大 token 上限，可能发生截断")
+        return list(dict.fromkeys(reasons))
 
     def _is_retryable_error(self, exc: Exception) -> bool:
         if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
@@ -161,19 +174,27 @@ class EventPipeline:
             event_result.final_action = "skip"
             return event_result
         
+        response = None
         try:
             response = self._classify_with_retry(self.text_provider, build_text_job_prompt(event, self.settings.subtitle_language), text_images)
             event_result.text_result = parse_text_result(response.text)
             event_result.text_result.usage = response.usage
             if event_result.text_result.matched:
+                review_reasons = self._text_review_reasons(event_result.text_result, response)
+                event_result.text_result.review_required = bool(review_reasons)
+                event_result.text_result.review_reasons = review_reasons
                 event.set_text(event_result.text_result.text)
                 event_result.final_action = "text_only"
                 logger.info(f"_process_text_event: {event.event_id} 文字提取成功: '{event_result.text_result.text[:30]}...'")
+                if event_result.text_result.review_required:
+                    logger.info(f"_process_text_event: {event.event_id} 文字识别需核查: {'; '.join(review_reasons)}")
             else:
                 logger.info(f"_process_text_event: {event.event_id} 未匹配到文字")
                 event_result.final_action = "skip"
         except Exception as exc:
             logger.error(f"_process_text_event: {event.event_id} 处理失败: {exc}")
+            if response is not None and event_result.text_result is None:
+                event_result.text_result = TextJobResult(matched=False, raw_response=response.text, usage=response.usage)
             event_result.error_messages.append(f"text_job: {exc}")
             event_result.failed_tasks.append("text")
             if event_result.final_action == "skip":
@@ -279,11 +300,28 @@ class EventPipeline:
 
         action_counts = {}
         error_count = 0
+        task_counts = {
+            "style_success": 0,
+            "style_no_match": 0,
+            "style_failed": 0,
+            "text_success": 0,
+            "text_no_match": 0,
+            "text_failed": 0,
+        }
         for result in results_map.values():
             action_counts[result.final_action] = action_counts.get(result.final_action, 0) + 1
             if result.error_messages:
                 error_count += 1
+            if "style" in result.failed_tasks:
+                task_counts["style_failed"] += 1
+            elif result.style_result is not None:
+                task_counts["style_success" if result.style_result.matched else "style_no_match"] += 1
+            if "text" in result.failed_tasks:
+                task_counts["text_failed"] += 1
+            elif result.text_result is not None:
+                task_counts["text_success" if result.text_result.matched else "text_no_match"] += 1
         logger.info(f"EventPipeline.run: 处理完成，结果统计: {action_counts}")
+        logger.info(f"EventPipeline.run: 任务统计: {task_counts}")
         if error_count > 0:
             logger.warning(f"EventPipeline.run: 有 {error_count} 个事件处理出错")
 

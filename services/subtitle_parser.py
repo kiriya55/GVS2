@@ -76,7 +76,6 @@ class GeneratedAssDocument(AssDocument):
             "[V4+ Styles]\n",
             "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n",
             f"Style: Default,{self.font_name},{self.font_size},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,{self.outline},{self.shadow},{self.alignment},{self.margin_l},{self.margin_r},{self.margin_v},1\n",
-            f"Style: 需核查,{self.font_name},{self.font_size},&H0000FFFF,&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,{max(self.outline, 3)},{max(self.shadow, 1)},{self.alignment},{self.margin_l},{self.margin_r},{self.margin_v},1\n",
             "\n",
             "[Events]\n",
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
@@ -228,6 +227,26 @@ def parse_subtitle_document(path: str) -> AssDocument:
     if suffix == ".srt":
         return parse_srt(path)
     raise ValueError("仅支持 ASS 或 SRT 输入")
+
+
+def extract_ass_style_section(path: str) -> list[str]:
+    """Return the original [V4+ Styles] section lines from an ASS file."""
+    raw_lines = Path(path).read_text(encoding="utf-8-sig").splitlines(keepends=True)
+    style_lines: list[str] = []
+    in_styles = False
+
+    for raw_line in raw_lines:
+        stripped = raw_line.strip()
+        if stripped.startswith("[V4+ Styles]") or stripped.startswith("[V4 Styles]"):
+            in_styles = True
+            style_lines.append(raw_line)
+            continue
+        if in_styles and stripped.startswith("["):
+            break
+        if in_styles:
+            style_lines.append(raw_line)
+
+    return style_lines
 
 
 def _parse_ass_color(color: str) -> str:

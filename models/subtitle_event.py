@@ -61,5 +61,10 @@ class SubtitleEvent:
         if not self.text.startswith(REVIEW_TEXT_OVERRIDE):
             self.set_text(self.text)
 
+    def clear_review_text_marker(self) -> None:
+        self.text_prefix = ""
+        if self.text.startswith(REVIEW_TEXT_OVERRIDE):
+            self.set_text(self.text[len(REVIEW_TEXT_OVERRIDE):])
+
     def to_ass_line(self) -> str:
         return f"{self.event_type}: " + ",".join(self.field_values)
